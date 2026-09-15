@@ -62,6 +62,11 @@ With the security plugin the user needs, at minimum:
 `admin` has all of these. Preflight checks the task-listing permission up front and refuses to
 start if it is missing, because the poll loop cannot work without it.
 
+With `--index-pattern` the Dashboards user also needs read and write access to the
+`index-pattern` saved objects in the tenant being refreshed (the `kibana_user` role, or its
+`kibana_all_write` tenant permission, in the security plugin's terms) and read access to the
+matching indices for the field lookup.
+
 ## Usage
 
 ```bash
@@ -116,12 +121,46 @@ Default is `https://` with certificate verification **off** and the warning sile
 | `--create-plain` | off | Allow creating a missing destination that matches no template, as a plain dynamically-mapped index |
 | `--poll-interval`, `--poll-grace` | `10`, `300` | Seconds between task-list polls (one request per interval for all jobs); seconds to tolerate an unreachable cluster before giving up on a job (it stays re-attachable) |
 | `--no-cluster-stats` | off | Do not fetch cluster health and write-pool stats every 30 s for the dashboard |
+| `--dashboards-url URL` | off | OpenSearch Dashboards base URL, usually `https://host:5601`. Env: `OSD_URL` |
+| `--index-pattern ID` | off | Index-pattern saved object to refresh after the run; repeatable or comma-separated. Needs `--dashboards-url` |
+| `--dashboards-user`, `--dashboards-password-env` | same as `--user`, `--password-env` | Dashboards credentials when they differ from the cluster's |
+| `--tenant NAME` | off | `securitytenant` header (`global`, `private`, or a tenant name) for multi-tenancy |
 | `--dry-run` | off | Read-only preflight, plan, and the list of writes a real run would send |
 | `-y`, `--yes` | off | No confirmation prompt |
 | `--state-file`, `--reset-state`, `--retry-failed` | `reindex-state.json` | Checkpoint control |
 | `--log-file`, `--json-log` | `reindex.log`, `reindex.jsonl` | Log files. Pass `''` to disable |
 | `--no-tui`, `--debug` | off | Plain output; log every poll and HTTP request to the log files |
 | `--timezone ZONE` | `America/Chicago` | Zone for the dashboard clock and finish times: an IANA name, `utc` or `local`. Env: `REINDEX_TZ` |
+
+### Dashboards index patterns
+
+Dashboards caches each index pattern's field list, so fields that only exist in reindexed
+data stay hidden until someone opens the pattern and clicks "refresh field list". Pass
+`--dashboards-url https://host:5601` (port 5601 is the Dashboards default; the OpenSearch port
+9200 is not the same API) and one or more `--index-pattern ID` (the saved object id from the
+pattern's URL in Stack Management, repeatable or comma-separated) and the tool does that
+refresh after the run:
+
+```bash
+poetry run reindex --host os-client.example --user admin --workers 2 \
+    --dashboards-url https://os-dashboards.example:5601 --tenant global \
+    --index-pattern 3b8c2d40-...  --index-pattern logs-star,metrics-star
+```
+
+For each id it reads the saved object, fetches the current field list for its title with the
+same `_fields_for_wildcard` request the button sends, and stores it back on the object. The
+credentials default to the cluster's `--user` and password; `--dashboards-user` and
+`--dashboards-password-env` override them, and `--tenant` sets the security plugin's
+`securitytenant` header, which decides where the saved object is looked up. TLS follows
+`--verify-certs` and `--ca-cert`.
+
+Every id is checked read-only before the run and at the start of a dry run, so a wrong id,
+URL, tenant or password stops the tool with exit 2 before anything is reindexed. The refresh
+itself runs only after a run that started jobs (not on a dry run, not when there was nothing
+to do), one console line and one `index_pattern_refreshed` log event per pattern; a failure
+there is reported in yellow with an `index_pattern_failed` event and does not change the exit
+code. The dry run lists the `PUT /api/saved_objects/index-pattern/<id>` requests under
+"after the run" and counts the Dashboards reads it sent.
 
 ### The list file
 
@@ -263,7 +302,8 @@ fails after verification, the job stays `verified` and the next run retries only
   `start`, `create`, `adopt`, `reattach`, `reattach_failed`, `already_present`, `done`,
   `verify_failed`, `failed`, `lost`,
   `delete`, `cancelled`, `held`, `poll_retry`, `child_list_failed`, `soft_stop`, `hard_stop`,
-  `force_exit`, `state_write_failed`, `crashed`, `run_end`, plus `poll` with `--debug` and
+  `force_exit`, `state_write_failed`, `crashed`, `run_end`, `index_pattern_refreshed`,
+  `index_pattern_failed`, plus `poll` with `--debug` and
   `progress` in plain mode.
 
   ```bash

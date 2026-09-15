@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import getpass
 import json
 import logging
@@ -20,10 +21,13 @@ import queue
 import re
 import select
 import signal
+import ssl
 import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 import warnings
 try:
     import termios
@@ -38,7 +42,7 @@ from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from zoneinfo import ZoneInfo
 
 from opensearchpy import OpenSearch
@@ -585,6 +589,101 @@ class Cluster:
             return
         if not resp.get("acknowledged"):
             raise JobError(f"delete of {index!r} was not acknowledged: {resp}")
+
+
+class DashboardsError(RuntimeError):
+    """An OpenSearch Dashboards request failed: bad URL, credentials, tenant, or index-pattern id."""
+
+
+class Dashboards:
+    """Saved-objects client for OpenSearch Dashboards, used to refresh index patterns.
+
+    Standard library HTTP only; the Dashboards API is plain JSON over ``/api``. Reads
+    are counted in ``reads`` and every write goes through ``_write()``, like ``Cluster``.
+    """
+    META_FIELDS = ("_source", "_id", "_type", "_index", "_score")
+
+    def __init__(self, *, url: str, user: str | None, password: str | None, verify_certs: bool,
+                 ca_cert: str | None, tenant: str | None = None, timeout: int = 30, dry_run: bool = False):
+        self.url = url.rstrip("/")
+        self.tenant = tenant
+        self.timeout = timeout
+        self.dry_run = dry_run
+        self.reads: Counter[str] = Counter()
+        self.headers = {"osd-xsrf": "true", "Accept": "application/json"}
+        if user:
+            token = base64.b64encode(f"{user}:{password or ''}".encode()).decode()
+            self.headers["Authorization"] = f"Basic {token}"
+        if tenant:
+            self.headers["securitytenant"] = tenant
+        ctx = ssl.create_default_context(cafile=ca_cert) if ca_cert else ssl.create_default_context()
+        if not verify_certs:
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        self.opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
+
+    # ---- guards / bookkeeping
+    def _write(self, what: str) -> None:
+        if self.dry_run:
+            raise DryRunViolation(f"dry run: refused to {what}")
+
+    def _read(self, what: str) -> None:
+        self.reads[what] += 1
+
+    def _request(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        data = json.dumps(body).encode() if body is not None else None
+        headers = dict(self.headers)
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(self.url + path, data=data, headers=headers, method=method)
+        try:
+            with self.opener.open(req, timeout=self.timeout) as resp:
+                raw = resp.read()
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace").strip()[:300]
+            hint = {401: "check --dashboards-user and its password",
+                    403: "user has no access to this saved object or tenant",
+                    404: "no such index pattern in this tenant, or not a Dashboards URL"}.get(e.code)
+            raise DashboardsError(f"{method} {path}: HTTP {e.code}" + (f" ({hint})" if hint else "")
+                                  + (f": {detail}" if detail else "")) from e
+        except urllib.error.URLError as e:
+            raise DashboardsError(f"{method} {self.url}{path}: {e.reason}") from e
+        except OSError as e:   # timeouts, TLS handshake failures
+            raise DashboardsError(f"{method} {self.url}{path}: {e}") from e
+        try:
+            return json.loads(raw) if raw else {}
+        except json.JSONDecodeError as e:
+            raise DashboardsError(f"{method} {path}: response is not JSON; is {self.url} the Dashboards URL "
+                                  "(port 5601), and is the login not redirected?") from e
+
+    # ---- read-only
+    def get_index_pattern(self, pattern_id: str) -> dict[str, Any]:
+        """The index-pattern saved object; 401/403/404 become a DashboardsError with a hint."""
+        self._read("GET /api/saved_objects/index-pattern/{id}")
+        return self._request("GET", f"/api/saved_objects/index-pattern/{quote(pattern_id, safe='')}")
+
+    def fields_for(self, title: str) -> list[dict[str, Any]]:
+        """Field list for a pattern title: what the UI's 'refresh field list' button fetches."""
+        self._read("GET /api/index_patterns/_fields_for_wildcard")
+        query = urlencode([("pattern", title)] + [("meta_fields", m) for m in self.META_FIELDS])
+        resp = self._request("GET", f"/api/index_patterns/_fields_for_wildcard?{query}")
+        fields = resp.get("fields")
+        if not isinstance(fields, list):
+            raise DashboardsError(f"_fields_for_wildcard for {title!r} returned no field list: {str(resp)[:200]}")
+        return fields
+
+    # ---- writes
+    def refresh(self, pattern_id: str) -> tuple[str, int]:
+        """Store a freshly fetched field list on the pattern. Returns (title, number of fields)."""
+        obj = self.get_index_pattern(pattern_id)
+        title = str((obj.get("attributes") or {}).get("title") or "")
+        if not title:
+            raise DashboardsError(f"index pattern {pattern_id!r} has no title: {str(obj)[:200]}")
+        fields = self.fields_for(title)
+        self._write(f"update index pattern {pattern_id}")
+        self._request("PUT", f"/api/saved_objects/index-pattern/{quote(pattern_id, safe='')}",
+                      {"attributes": {"fields": json.dumps(fields)}})
+        return title, len(fields)
 
 
 # --------------------------------------------------------------------------- logging
@@ -1940,7 +2039,7 @@ def plan_table(jobs: list[Job], plan: dict[str, dict[str, Any]], delete_source: 
 
 
 def writes_table(jobs: list[Job], plan: dict[str, dict[str, Any]], args: argparse.Namespace,
-                 cluster: Cluster) -> Group:
+                 cluster: Cluster, dashboards: Dashboards | None = None) -> Group:
     """Dry run: every write request a real run would send, per job, in order."""
     t = Table(title="Write requests a real run would send (none were sent)", box=box.SIMPLE_HEAD)
     t.add_column("Job", overflow="fold")
@@ -1993,12 +2092,21 @@ def writes_table(jobs: list[Job], plan: dict[str, dict[str, Any]], args: argpars
             n_destructive += 1
     if n_writes == 0 and n_destructive == 0:
         t.add_row(Text("nothing to do", style="dim"), "", "")
+    # Dashboards index patterns are refreshed only after a run that actually ran something.
+    runnable = any(plan[j.key]["action"] not in ("skip", "error") for j in jobs)
+    patterns = list(args.index_pattern or []) if dashboards is not None and runnable else []
+    for i, pid in enumerate(patterns):
+        t.add_row(Text("after the run") if i == 0 else "",
+                  Text(f"PUT /api/saved_objects/index-pattern/{pid}  (refresh field list via GET _fields_for_wildcard)"),
+                  write)
     lines = [t,
              Text.assemble("Conditional: ", ("POST /_tasks/<id>/_cancel", "yellow"),
                            " for each running task on a second Ctrl+C."),
              Text.assemble(f"Totals: {n_create} destination(s) to create, {n_writes} reindex request(s), ",
-                           (f"{n_destructive} index delete(s)", "bold red" if n_destructive else ""), ".")]
-    reads = ", ".join(f"{k} x{v}" for k, v in sorted(cluster.reads.items()))
+                           (f"{n_destructive} index delete(s)", "bold red" if n_destructive else ""),
+                           f", {len(patterns)} index pattern(s) to refresh" if dashboards is not None else "", ".")]
+    all_reads = cluster.reads + dashboards.reads if dashboards is not None else cluster.reads
+    reads = ", ".join(f"{k} x{v}" for k, v in sorted(all_reads.items()))
     lines.append(Text(f"Read-only requests this dry run sent: {reads}", style="dim"))
     return Group(*lines)
 
@@ -2132,6 +2240,20 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
                    help="seconds to keep retrying an unreachable cluster before giving up on a job "
                         "(the job stays re-attachable)")
 
+    d = p.add_argument_group("dashboards")
+    d.add_argument("--dashboards-url", default=env_default("OSD_URL", None), metavar="URL",
+                   help="OpenSearch Dashboards base URL, e.g. https://host:5601 [env OSD_URL]")
+    d.add_argument("--index-pattern", action="append", default=None, metavar="ID",
+                   help="id of an index-pattern saved object whose field list is refreshed after the run "
+                        "(repeatable, or comma-separated); needs --dashboards-url")
+    d.add_argument("--dashboards-user", default=None, metavar="USER",
+                   help="basic-auth user for Dashboards (default: same as --user; '' for none)")
+    d.add_argument("--dashboards-password-env", default=None, metavar="VAR",
+                   help="name of the env var holding the Dashboards password (default: same as --password-env)")
+    d.add_argument("--tenant", default=None,
+                   help="securitytenant header for the security plugin's multi-tenancy "
+                        "(global, private, or a tenant name; default: the user's default tenant)")
+
     s = p.add_argument_group("run control")
     s.add_argument("--dry-run", action="store_true",
                    help="send only read requests; print the plan and every write a real run would send")
@@ -2181,6 +2303,15 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
               f"(install the tzdata package or pass --timezone)", file=sys.stderr)
         a.timezone, a.tzinfo = "local", None
     a.cluster_health = {}
+    a.index_pattern = [i.strip() for chunk in (a.index_pattern or []) for i in chunk.split(",") if i.strip()]
+    if a.index_pattern and not a.dashboards_url:
+        p.error("--index-pattern requires --dashboards-url (or OSD_URL)")
+    if a.dashboards_url and not str(a.dashboards_url).startswith(("http://", "https://")):
+        p.error("--dashboards-url must start with http:// or https://")
+    if a.dashboards_user is None:
+        a.dashboards_user = a.user
+    if a.dashboards_password_env is None:
+        a.dashboards_password_env = a.password_env
     if str(a.log_file) in ("", "."):
         a.log_file = None
     if str(a.json_log) in ("", "."):
@@ -2199,6 +2330,57 @@ def confirm(console: Console, prompt: str, yes: bool, word: str = "y") -> bool:
     return answer in ("y", "yes") if word == "y" else answer == word
 
 
+def setup_dashboards(args: argparse.Namespace, password: str | None, console: Console) -> Dashboards | None:
+    """Client for --index-pattern, after a read-only check that every id resolves. None when unused.
+
+    Raises DashboardsError for anything that would make the post-run refresh fail.
+    """
+    if not args.index_pattern:
+        return None
+    user = args.dashboards_user or None
+    if user and user == args.user and args.dashboards_password_env == args.password_env:
+        dpw = password
+    elif user:
+        dpw = os.environ.get(args.dashboards_password_env)
+        if dpw is None:
+            if not sys.stdin.isatty():
+                raise DashboardsError(f"set ${args.dashboards_password_env} (or --dashboards-password-env) "
+                                      "when not running interactively")
+            dpw = getpass.getpass(f"Dashboards password for {user} (env {args.dashboards_password_env} is unset): ")
+    else:
+        dpw = None
+    d = Dashboards(url=args.dashboards_url, user=user, password=dpw, verify_certs=args.verify_certs,
+                   ca_cert=args.ca_cert, tenant=args.tenant, timeout=args.timeout, dry_run=args.dry_run)
+    titles = []
+    for pid in args.index_pattern:
+        title = (d.get_index_pattern(pid).get("attributes") or {}).get("title") or "?"
+        titles.append(f"{pid} ({title})")
+    LOG.info("Dashboards %s: %d index pattern(s) to refresh after the run: %s", d.url, len(titles), ", ".join(titles))
+    console.print(Text(f"Dashboards {d.url}" + (f" tenant {args.tenant}" if args.tenant else "")
+                       + f": will refresh {len(titles)} index pattern(s) after the run: " + ", ".join(titles),
+                       style="dim"))
+    return d
+
+
+def refresh_index_patterns(dashboards: Dashboards, ids: list[str], console: Console) -> int:
+    """Post-run hook: refresh each pattern's field list. Failures are reported, never fatal."""
+    failed = 0
+    for pid in ids:
+        try:
+            title, n = dashboards.refresh(pid)
+        except Exception as e:  # noqa: BLE001 - a Dashboards problem must not change the exit code
+            failed += 1
+            reason = describe(e)
+            LOG.error("index pattern %s not refreshed: %s", pid, reason,
+                      extra={"event": "index_pattern_failed", "reason": reason})
+            console.print(Text(f"index pattern {pid} not refreshed: {reason}", style="yellow"))
+        else:
+            LOG.info("index pattern %s (%s) refreshed: %d fields", pid, title, n,
+                     extra={"event": "index_pattern_refreshed", "counts": {"fields": n}})
+            console.print(Text.assemble("index pattern ", (title, "bold"), f" ({pid}) refreshed: {n:,} fields"))
+    return failed
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     console = Console()
@@ -2214,6 +2396,12 @@ def main(argv: list[str] | None = None) -> int:
             err(f"set ${args.password_env} (or --password-env) when not running interactively")
             return 2
         password = getpass.getpass(f"Password for {args.user} (env {args.password_env} is unset): ")
+    try:
+        dashboards = setup_dashboards(args, password, console)
+    except DashboardsError as e:
+        err(f"Dashboards: {e}")
+        LOG.error("Dashboards: %s", e, extra={"event": "index_pattern_failed", "reason": str(e)})
+        return 2
 
     try:
         jobs = load_jobs(args.list)
@@ -2292,12 +2480,12 @@ def main(argv: list[str] | None = None) -> int:
         if not args.skip_missing:
             err(f"{len(problems)} job(s) failed preflight. Fix them or pass --skip-missing.")
             if args.dry_run:
-                console.print(writes_table(jobs, plan, args, cluster))
+                console.print(writes_table(jobs, plan, args, cluster, dashboards))
             return 2
         console.print(Text(f"{len(problems)} job(s) failed preflight and will be skipped.", style="yellow"))
     runnable = [j for j in jobs if plan[j.key]["action"] not in ("skip", "error")]
     if args.dry_run:
-        console.print(writes_table(jobs, plan, args, cluster))
+        console.print(writes_table(jobs, plan, args, cluster, dashboards))
         console.print(Text(f"dry run: {len(runnable)} job(s) would run; nothing was written.", style="yellow"))
         return 0
     if not runnable:
@@ -2346,6 +2534,8 @@ def main(argv: list[str] | None = None) -> int:
     console.print(summary_table(jobs, state, runner))
     t = runner.tally()
     # post-run hooks (e.g. refreshing Dashboards index patterns) go here
+    if dashboards is not None:
+        refresh_index_patterns(dashboards, args.index_pattern, console)
     LOG.info("run finished: %d done, %d failed, %d lost, exit=%d", t["done"], t["failed"], t["lost"], code,
              extra={"event": "run_end", "elapsed_s": round(time.monotonic() - runner.t0, 1)})
     if t["failed"]:
