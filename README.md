@@ -292,7 +292,11 @@ before it and the summary after it, in the normal scrollback):
 The dashboard itself never calls the cluster; it only renders the poller's numbers twice a
 second. Keys while it runs: `q` stop launching new jobs, `Q` cancel running tasks, `-` and `+`
 lower or raise the number of jobs allowed to run at once (takes effect as jobs finish), `p`
-pause launching. Ctrl+C once and twice still mean `q` and `Q`.
+pause launching, `d` toggle `--delete-source` (turning it on opens a confirmation box and only
+`y` confirms; applies to jobs that have not reached the delete step yet), `t` toggle
+`--tune-dest` for jobs that have not started, `c` toggle creating missing destinations (jobs
+planned to create one fail cleanly at start while it is off). The footer shows each toggle's
+current state. Ctrl+C once and twice still mean `q` and `Q`.
 
 **ETA.** Throughput is measured as documents processed per second. The ETA uses the run's
 average rate once at least five minutes or 5 % of the documents have passed (before that, the

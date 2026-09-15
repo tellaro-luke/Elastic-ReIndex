@@ -736,6 +736,21 @@ class Dialog:
         return ch in ("\x1b", "q")
 
 
+class ConfirmDialog(Dialog):
+    """Yes/no question: ``y`` runs ``on_yes`` and closes; any other key just closes."""
+
+    def __init__(self, title: str, message: str, on_yes: Callable[[], None]):
+        self.title, self.message, self.on_yes = title, message, on_yes
+
+    def render(self, width: int, height: int) -> Panel:
+        return Panel(Text(self.message), title=self.title, border_style="red")
+
+    def handle(self, ch: str) -> bool:
+        if ch == "y":
+            self.on_yes()
+        return True
+
+
 class Runner:
     POOL_CAP = 64
 
@@ -813,6 +828,39 @@ class Runner:
         self.add_key("-", "-/+ slots", fewer, aliases=("_",))
         self.add_key("+", "", more, aliases=("=",))
         self.add_key("p", "p pause", pause)
+
+        def label(ch: str, name: str, on: bool) -> str:
+            return f"{ch} {name}:{'on' if on else 'off'}"
+
+        def set_toggle(ch: str, name: str, attr: str, value: bool, on: bool, level: int = logging.INFO) -> None:
+            """Store ``value`` in args.<attr>; ``on`` is what the footer and log call it."""
+            setattr(self.args, attr, value)
+            self.key_bindings[ch] = (label(ch, name, on), self.key_bindings[ch][1])
+            LOG.log(level, "%s turned %s (%s key)", name, "on" if on else "off", ch,
+                    extra={"event": "toggle", "setting": attr, "value": value})
+
+        def toggle_delete() -> None:
+            if self.args.delete_source:
+                set_toggle("d", "delete", "delete_source", False, on=False)
+                return
+            self.dialog = ConfirmDialog(
+                "delete source?",
+                "Delete each source index after its reindex verifies. Applies to jobs that have not "
+                "reached the delete step yet. Press y to confirm, any other key to cancel.",
+                lambda: set_toggle("d", "delete", "delete_source", True, on=True, level=logging.WARNING))
+
+        def toggle_tune() -> None:
+            on = not self.args.tune_dest
+            set_toggle("t", "tune", "tune_dest", on, on=on)
+
+        def toggle_create() -> None:
+            # args.no_create is the inverse of the label; jobs planned to create check it when they start.
+            on = bool(self.args.no_create)
+            set_toggle("c", "create", "no_create", not on, on=on)
+
+        self.add_key("d", label("d", "delete", bool(self.args.delete_source)), toggle_delete)
+        self.add_key("t", label("t", "tune", bool(self.args.tune_dest)), toggle_tune)
+        self.add_key("c", label("c", "create", not self.args.no_create), toggle_create)
 
     def key_help(self) -> Text:
         """Footer text built from the bindings: labels are 'KEY description'."""
@@ -901,6 +949,8 @@ class Runner:
             if task_id is None:
                 create = self.plan[key].get("create")
                 if create and not self.cluster.index_exists(job.dest):
+                    if a.no_create:
+                        raise JobError("destination missing and creation is turned off (c key)")
                     self._phase(key, "creating")
                     shards = self.plan[key].get("shards")
                     self.cluster.create_destination(job.dest, create, shards=shards)
@@ -949,6 +999,9 @@ class Runner:
 
         deleted = bool(st.get("deleted_source"))
         if a.delete_source and not deleted:
+            reason = self._delete_guard(key)
+            if reason:
+                raise JobError(f"reindex verified but source kept: {reason}")
             if self.hard_stop.is_set():
                 raise Cancelled("stop requested before the source delete")
             self._phase(key, "deleting")
@@ -965,6 +1018,21 @@ class Runner:
                  fmt_secs(elapsed), " (source deleted)" if deleted else "",
                  extra={"event": "done", "task": task_id, "elapsed_s": round(elapsed, 1), "counts": counts})
         return "done", counts
+
+    def _delete_guard(self, key: str) -> str | None:
+        """Why the source of ``key`` must not be deleted, or None when it may be.
+
+        Preflight only checks this when --delete-source is on at start; the d key can turn
+        it on later, so the delete step asks again using the plan row.
+        """
+        row = self.plan.get(key) or {}
+        kind = row.get("src_kind")
+        if kind in ("alias", "data_stream"):
+            return f"source is a {kind.replace('_', ' ')}, not an index"
+        owner = row.get("src_write_index_of")
+        if owner:
+            return f"source is the write index of data stream {owner!r}; roll it over first"
+        return None
 
     def _untune(self, key: str, log: JobLog) -> None:
         """Restore replicas/refresh recorded by --tune-dest (also on resume)."""
@@ -1321,9 +1389,10 @@ class Runner:
             return Text("STOPPING", style="bold yellow")
         if self.paused:
             return Text("PAUSED", style="bold yellow")
-        if a.delete_source:
-            return Text("DELETE SOURCE", style="bold red")
-        return Text("keep sources", style="green")
+        mode = Text("DELETE SOURCE", style="bold red") if a.delete_source else Text("keep sources", style="green")
+        if a.tune_dest:
+            mode.append(" · tune", style="cyan")
+        return mode
 
     def render(self, ring: RingHandler) -> Layout | Group:
         a = self.args
@@ -1652,12 +1721,16 @@ def preflight(cluster: Cluster, jobs: list[Job], state: State, args: argparse.Na
             elif status in REATTACH_STATUSES and st.get("task"):
                 row.update(action="re-attach", note=f"task {st['task']}")
             src_kind, _ = resolve(job.source)
+            row["src_kind"] = src_kind
+            # Always recorded: the d key can turn on --delete-source later and the delete step re-checks it.
+            row["src_write_index_of"] = next((n for n, d in snap.data_streams.items()
+                                              if d["write_index"] == job.source), None)
             if src_kind == "index" and snap.indices[job.source].get("status") == "close":
                 raise JobError("source index is closed")
             if args.delete_source and src_kind in ("alias", "data_stream"):
                 raise JobError(f"source is a {src_kind.replace('_', ' ')}; refusing with --delete-source")
             if args.delete_source and src_kind == "index":
-                owner = next((n for n, d in snap.data_streams.items() if d["write_index"] == job.source), None)
+                owner = row["src_write_index_of"]
                 if owner:
                     raise JobError(f"source is the write index of data stream {owner!r}; "
                                    "roll it over first or drop --delete-source")
