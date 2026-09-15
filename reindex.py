@@ -14,18 +14,27 @@ import argparse
 import getpass
 import json
 import logging
+import math
 import os
+import queue
 import re
+import select
 import signal
 import sys
 import tempfile
 import threading
 import time
 import warnings
+try:
+    import termios
+    import tty
+except ImportError:  # Windows
+    termios = None  # type: ignore[assignment]
+    tty = None  # type: ignore[assignment]
 from collections import Counter, deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
@@ -35,6 +44,7 @@ from opensearchpy import OpenSearch
 from opensearchpy import exceptions as os_exc
 from rich import box
 from rich.console import Console, Group
+from rich.layout import Layout
 from rich.live import Live
 from rich.logging import RichHandler
 from rich.panel import Panel
@@ -64,12 +74,17 @@ def fmt_secs(s: float) -> str:
 
 
 def fmt_eta(s: float) -> str:
-    """Coarser than fmt_secs so a long ETA does not flicker."""
-    if s < 3600:
-        return "~" + fmt_secs(s)
-    step = 300 if s >= 6 * 3600 else 60
-    s = round(s / step) * step
-    return f"~{int(s // 3600)}h{int(s % 3600 // 60):02d}m"
+    """Two largest units, spilling into days and weeks: ~3w 2d, ~4d 6h, ~5h 20m, ~12m 05s."""
+    s = int(max(s, 0))
+    if s >= 7 * 86400:
+        w, rem = divmod(s, 7 * 86400)
+        return f"~{w}w {rem // 86400}d"
+    if s >= 86400:
+        d, rem = divmod(s, 86400)
+        return f"~{d}d {rem // 3600}h"
+    if s >= 3600:
+        return f"~{s // 3600}h {s % 3600 // 60:02d}m"
+    return f"~{s // 60}m {s % 60:02d}s"
 
 
 def describe(e: BaseException) -> str:
@@ -377,8 +392,8 @@ class Cluster:
     def snapshot(self) -> Snapshot:
         snap = Snapshot()
         self._read("GET /_cat/indices")
-        for row in self.os.cat.indices(h="index,docs.count,status,health", format="json",
-                                       expand_wildcards="all"):
+        for row in self.os.cat.indices(h="index,docs.count,store.size,status,health", format="json",
+                                       expand_wildcards="all", bytes="b"):
             snap.indices[row["index"]] = row
         self._read("GET /_alias")
         for index, body in self.os.indices.get_alias().items():
@@ -392,8 +407,13 @@ class Cluster:
         self._read("GET /_index_template")
         for t in self.os.indices.get_index_template().get("index_templates") or []:
             body = t.get("index_template") or {}
+            settings = (body.get("template") or {}).get("settings") or {}
+            shards = (settings.get("index.number_of_shards")
+                      or (settings.get("index") or {}).get("number_of_shards")
+                      or settings.get("number_of_shards"))
             snap.templates.append({"name": t.get("name"), "patterns": list(body.get("index_patterns") or []),
-                                   "priority": int(body.get("priority") or 0), "data_stream": "data_stream" in body})
+                                   "priority": int(body.get("priority") or 0), "data_stream": "data_stream" in body,
+                                   "shards": int(shards) if shards else None})
         snap.templates.sort(key=lambda t: -t["priority"])
         return snap
 
@@ -439,6 +459,53 @@ class Cluster:
             return None
         return {k: sum(int(st.get(k) or 0) for st in statuses) for k in COUNT_FIELDS}
 
+    def list_reindex_tasks(self) -> dict[str, dict[str, int]]:
+        """Counters of every running top-level reindex task, with running slices summed in."""
+        self._read("GET /_tasks?actions=*reindex&detailed")
+        resp = self.os.tasks.list(actions="*reindex", detailed=True)
+        parents: dict[str, dict[str, int]] = {}
+        children: dict[str, dict[str, int]] = {}
+        for node in (resp.get("nodes") or {}).values():
+            for tid, t in (node.get("tasks") or {}).items():
+                counts = {k: int((t.get("status") or {}).get(k) or 0) for k in COUNT_FIELDS}
+                parent = t.get("parent_task_id")
+                if parent:
+                    acc = children.setdefault(parent, dict.fromkeys(COUNT_FIELDS, 0))
+                    for k in COUNT_FIELDS:
+                        acc[k] += counts[k]
+                else:
+                    parents[tid] = counts
+        for tid, acc in children.items():
+            if tid in parents:
+                parents[tid] = {k: parents[tid][k] + acc[k] for k in COUNT_FIELDS}
+        return parents
+
+    def health(self) -> dict[str, Any]:
+        self._read("GET /_cluster/health")
+        return self.os.cluster.health()
+
+    def write_pool(self) -> list[dict[str, Any]]:
+        self._read("GET /_cat/thread_pool/write")
+        return list(self.os.cat.thread_pool(thread_pool_patterns="write", h="node_name,active,queue,rejected",
+                                            format="json"))
+
+    def write_index_of(self, name: str, kind: str) -> str:
+        if kind != "data_stream":
+            return name
+        self._read("GET /_data_stream/{name}")
+        ds = self.os.indices.get_data_stream(name=name)["data_streams"][0]
+        return ds["indices"][-1]["index_name"]
+
+    def get_index_settings(self, index: str) -> dict[str, Any]:
+        self._read("GET /{index}/_settings")
+        resp = self.os.indices.get_settings(index=index, name="index.number_of_replicas,index.refresh_interval")
+        idx = ((next(iter(resp.values())) or {}).get("settings") or {}).get("index") or {}
+        return {"number_of_replicas": idx.get("number_of_replicas"), "refresh_interval": idx.get("refresh_interval")}
+
+    def put_index_settings(self, index: str, settings: dict[str, Any]) -> None:
+        self._write(f"change settings of {index}")
+        self.os.indices.put_settings(index=index, body={"index": settings})
+
     def find_reindex_task(self, job: Job) -> str | None:
         """Id of a running top-level reindex for this exact source/dest, if any."""
         self._read("GET /_tasks?actions=*reindex&detailed")
@@ -452,24 +519,29 @@ class Cluster:
 
     # ---- writes
     def reindex_request(self, job: Job, *, slices: str, rps: float, conflicts: str,
-                        require_alias: bool, dest_kind: str | None = None) -> tuple[str, dict[str, Any]]:
+                        require_alias: bool, dest_kind: str | None = None,
+                        batch_size: int = 1000) -> tuple[str, dict[str, Any]]:
         params: dict[str, Any] = {"wait_for_completion": "false", "slices": slices,
-                                  "requests_per_second": rps}
+                                  "requests_per_second": int(rps) if float(rps).is_integer() else rps}
         if require_alias:
             params["require_alias"] = "true"
         body: dict[str, Any] = {"source": {"index": job.source}, "dest": {"index": job.dest},
                                 "conflicts": conflicts}
+        if batch_size and batch_size != 1000:
+            body["source"]["size"] = int(batch_size)
         if dest_kind == "data_stream":
             body["dest"]["op_type"] = "create"   # data streams are append-only
             body["conflicts"] = "proceed"        # a re-run must not abort on docs already there
         return f"POST /_reindex?{urlencode(params)}", body
 
-    def create_destination(self, name: str, kind: str) -> None:
+    def create_destination(self, name: str, kind: str, shards: int | None = None) -> None:
         """Create a missing destination; the matching index template supplies its settings."""
         self._write(f"create {kind} {name}")
         try:
             if kind == "data_stream":
                 self.os.indices.create_data_stream(name=name)
+            elif shards:
+                self.os.indices.create(index=name, body={"settings": {"index.number_of_shards": int(shards)}})
             else:
                 self.os.indices.create(index=name)
         except os_exc.RequestError as e:
@@ -619,21 +691,66 @@ class JobView:
     source_count: int = 0
 
 
+def sparkline(values: list[float], rows: int = 2) -> list[Text]:
+    """btop-style block graph: ``rows`` lines of block characters, oldest value first."""
+    blocks = " ▁▂▃▄▅▆▇█"
+    peak = max(values) if values and max(values) > 0 else 1.0
+    lines: list[Text] = []
+    for r in range(rows):
+        t = Text()
+        for v in values:
+            level = v / peak * 8 * rows
+            row_level = level - 8 * (rows - 1 - r)
+            idx = int(min(8, max(0, round(row_level))))
+            style = "bright_cyan" if v >= 0.66 * peak else ("cyan" if v >= 0.33 * peak else "blue")
+            t.append(blocks[idx], style=style)
+        lines.append(t)
+    return lines
+
+
+def fmt_finish(dt: datetime) -> str:
+    now = datetime.now().astimezone()
+    if dt.date() == now.date():
+        return dt.strftime("today %H:%M %Z").strip()
+    if (dt.date() - now.date()).days == 1:
+        return dt.strftime("tomorrow %H:%M %Z").strip()
+    return dt.strftime("%a %d %b %H:%M %Z").strip()
+
+
 class Runner:
+    POOL_CAP = 64
+
     def __init__(self, args: argparse.Namespace, cluster: Cluster, state: State,
-                 jobs: list[Job], plan: dict[str, dict[str, Any]], cluster_name: str, console: Console):
+                 jobs: list[Job], plan: dict[str, dict[str, Any]], cluster_name: str, console: Console,
+                 cluster_stats: dict[str, Any] | None = None):
         self.args, self.cluster, self.state, self.jobs, self.plan = args, cluster, state, jobs, plan
         self.cluster_name = cluster_name
         self.console = console
         self.soft_stop = threading.Event()
         self.hard_stop = threading.Event()
+        self.paused = False
+        self.max_active = args.workers
         self.lock = threading.Lock()
         self.views: dict[str, JobView] = {}
         self.results: dict[str, str] = {}   # key -> done|failed|lost|held|cancelled|skipped
         self.finished_docs = 0              # docs processed by jobs completed in this run
         self.deleted = 0
-        self.samples: deque[tuple[float, int]] = deque(maxlen=600)
+        self.samples: deque[tuple[float, int]] = deque(maxlen=2400)
+        self.rate_smooth = 0.0
+        self.rate_ts = 0.0
         self.t0 = time.monotonic()
+        # shared poller
+        self.task_jobs: dict[str, str] = {}
+        self.poll_cv = threading.Condition()
+        self.poll_gen = 0
+        self.poll_tasks: dict[str, dict[str, int]] = {}
+        self.poll_error: BaseException | None = None
+        self.poll_stop = threading.Event()
+        self.cluster_stats: dict[str, Any] = dict(cluster_stats or {})
+        self.rejected_base: int | None = None
+        # keyboard
+        self.keys: queue.Queue[str] = queue.Queue()
+        self.keys_stop = threading.Event()
 
     # ---- per-job pipeline
     def run_job(self, job: Job) -> str:
@@ -688,6 +805,7 @@ class Runner:
         st = self.state.job(key)
         counts: dict[str, int] | None = None
         task_id: str | None = None
+        dest_kind = self.plan[key].get("dest_kind")
 
         if st.get("status") != "verified":
             if st.get("task") and st.get("status") in REATTACH_STATUSES:
@@ -712,9 +830,20 @@ class Runner:
                 create = self.plan[key].get("create")
                 if create and not self.cluster.index_exists(job.dest):
                     self._phase(key, "creating")
-                    self.cluster.create_destination(job.dest, create)
-                    log.info("created %s %s (template %s)", create.replace("_", " "), job.dest,
-                             self.plan[key].get("template") or "none", extra={"event": "create"})
+                    shards = self.plan[key].get("shards")
+                    self.cluster.create_destination(job.dest, create, shards=shards)
+                    log.info("created %s %s (template %s%s)", create.replace("_", " "), job.dest,
+                             self.plan[key].get("template") or "none",
+                             f", {shards} primary shards" if shards else "", extra={"event": "create"})
+                if a.tune_dest and dest_kind in ("index", "data_stream") and not st.get("tune"):
+                    self._phase(key, "tuning")
+                    idx = self.cluster.write_index_of(job.dest, dest_kind)
+                    orig = self.cluster.get_index_settings(idx)
+                    self._record(key, tune={"index": idx, **orig}, flush=True)
+                    self.cluster.put_index_settings(idx, {"number_of_replicas": 0, "refresh_interval": "-1"})
+                    log.info("tuned %s for bulk load: replicas 0, refresh off (was replicas=%s, refresh=%s)",
+                             idx, orig.get("number_of_replicas"), orig.get("refresh_interval") or "default",
+                             extra={"event": "tune"})
                 source_count = self.cluster.count(job.source)
                 with self.lock:
                     self.views[key].source_count = source_count
@@ -722,7 +851,7 @@ class Runner:
                              note=None, task=None, source_count=source_count, deleted_source=False)
                 task_id = self.cluster.start_reindex(
                     job, slices=a.slices, rps=a.requests_per_second, conflicts=a.conflicts,
-                    require_alias=a.require_alias, dest_kind=self.plan[key].get("dest_kind"))
+                    require_alias=a.require_alias, dest_kind=dest_kind, batch_size=a.batch_size)
                 self._record(key, task=task_id, flush=True)
                 log.info("started task %s for %d docs", task_id, source_count,
                          extra={"event": "start", "task": task_id, "counts": {"total": source_count}})
@@ -732,6 +861,7 @@ class Runner:
             self._phase(key, "verifying")
             self._record(key, status="verifying", **counts)
             reasons = self._verify(job, task, log)
+            self._untune(key, log)
             if reasons:
                 reason = "; ".join(reasons)
                 self._record(key, status="failed", finished=utcnow(), error=reason)
@@ -743,6 +873,7 @@ class Runner:
             counts = {k: int(st.get(k) or 0) for k in COUNT_FIELDS}
             task_id = st.get("task")
             log.info("already verified in a previous run; finishing", extra={"event": "resume_verified"})
+            self._untune(key, log)
 
         deleted = bool(st.get("deleted_source"))
         if a.delete_source and not deleted:
@@ -763,67 +894,90 @@ class Runner:
                  extra={"event": "done", "task": task_id, "elapsed_s": round(elapsed, 1), "counts": counts})
         return "done", counts
 
+    def _untune(self, key: str, log: JobLog) -> None:
+        """Restore replicas/refresh recorded by --tune-dest (also on resume)."""
+        tune = self.state.job(key).get("tune")
+        if not tune:
+            return
+        try:
+            self.cluster.put_index_settings(tune["index"], {
+                "number_of_replicas": tune.get("number_of_replicas"),
+                "refresh_interval": tune.get("refresh_interval")})
+            log.info("restored %s: replicas=%s, refresh=%s", tune["index"], tune.get("number_of_replicas"),
+                     tune.get("refresh_interval") or "default", extra={"event": "untune"})
+            self._record(key, tune=None, flush=True)
+        except os_exc.OpenSearchException as e:
+            log.error("could not restore settings on %s (replicas=%s refresh=%s): %s", tune["index"],
+                      tune.get("number_of_replicas"), tune.get("refresh_interval"), describe(e),
+                      extra={"event": "untune_failed"})
+
     def _wait(self, job: Job, task_id: str, log: JobLog) -> dict[str, Any]:
+        """Follow a task through the shared poller until it leaves the task list."""
+        with self.lock:
+            self.task_jobs[task_id] = job.key
+        with self.poll_cv:
+            seen_gen = self.poll_gen
         grace_until: float | None = None
-        warned_children = False
-        while True:
-            if self.hard_stop.is_set():
-                try:
-                    self.cluster.cancel_task(task_id)
-                except os_exc.NotFoundError:
-                    task = self.cluster.get_task(task_id)
-                    if task.get("completed"):
-                        log.info("task %s had already completed when cancel was requested", task_id)
-                        return task
-                except os_exc.OpenSearchException as e:
-                    raise Unreachable(f"cancel of task {task_id} failed: {describe(e)}")
-                raise Cancelled(f"task {task_id} cancelled by user")
-            try:
-                task = self.cluster.get_task(task_id)
+        try:
+            while True:
+                if self.hard_stop.is_set():
+                    try:
+                        self.cluster.cancel_task(task_id)
+                    except os_exc.NotFoundError:
+                        task = self.cluster.get_task(task_id)
+                        if task.get("completed"):
+                            log.info("task %s had already completed when cancel was requested", task_id)
+                            return task
+                    except os_exc.OpenSearchException as e:
+                        raise Unreachable(f"cancel of task {task_id} failed: {describe(e)}")
+                    raise Cancelled(f"task {task_id} cancelled by user")
+                with self.poll_cv:
+                    self.poll_cv.wait_for(lambda: self.poll_gen > seen_gen or self.hard_stop.is_set(), timeout=1.0)
+                    if self.poll_gen <= seen_gen:
+                        continue
+                    seen_gen = self.poll_gen
+                    err = self.poll_error
+                    listed = task_id in self.poll_tasks
+                    counts = self.poll_tasks.get(task_id)
+                if err is not None:
+                    now = time.monotonic()
+                    if not transient(err):
+                        raise Unreachable(f"poll of tasks rejected: {describe(err)}")
+                    if grace_until is None:
+                        grace_until = now + self.args.poll_grace
+                    if now > grace_until:
+                        raise Unreachable(f"could not reach the cluster for {self.args.poll_grace:g}s: {describe(err)}")
+                    log.warning("poll failed (%s); retrying for another %s",
+                                describe(err), fmt_secs(grace_until - now), extra={"event": "poll_retry"})
+                    continue
                 grace_until = None
-            except os_exc.NotFoundError:
-                raise JobError(f"task {task_id} is gone from the cluster (node restart, or the .tasks "
-                               "index could not be written)")
-            except os_exc.OpenSearchException as e:
-                now = time.monotonic()
-                if not transient(e):
-                    raise Unreachable(f"poll of task {task_id} rejected: {describe(e)}")
-                if grace_until is None:
-                    grace_until = now + self.args.poll_grace
-                if now > grace_until:
-                    raise Unreachable(f"could not reach the cluster for {self.args.poll_grace:g}s: {describe(e)}")
-                log.warning("poll failed (%s); retrying for another %s",
-                            describe(e), fmt_secs(grace_until - now), extra={"event": "poll_retry"})
-                self.hard_stop.wait(self.args.poll_interval)
-                continue
-            counts = task_counts(task)
-            if not task.get("completed") and str(self.args.slices) != "1":
+                if listed:
+                    log.debug("poll: %s", counts, extra={"event": "poll", "task": task_id, "counts": counts})
+                    continue
+                # Not in the list: finished (result stored in .tasks), or not yet registered.
                 try:
-                    children = self.cluster.child_counts(task_id)
-                except os_exc.OpenSearchException as e:
-                    children = None
-                    if not warned_children:
-                        warned_children = True
-                        log.warning("cannot list child tasks, progress will show 0 until slices finish: %s",
-                                    describe(e), extra={"event": "child_list_failed"})
-                if children:
-                    counts = {k: counts[k] + children[k] for k in COUNT_FIELDS}
-            with self.lock:
-                self.views[job.key].counts = counts
-            log.debug("poll: %s", counts, extra={"event": "poll", "task": task_id, "counts": counts})
-            if task.get("completed"):
+                    task = self.cluster.get_task(task_id)
+                except os_exc.NotFoundError:
+                    raise JobError(f"task {task_id} is gone from the cluster (node restart, or the .tasks "
+                                   "index could not be written)")
+                if not task.get("completed"):
+                    continue
+                with self.lock:
+                    self.views[job.key].counts = task_counts(task)
                 if "error" in task:
-                    err = task["error"]
-                    if isinstance(err, dict):
-                        inner = err.get("caused_by") or {}
-                        reason = f"{err.get('type')}: {err.get('reason')}"
+                    err_ = task["error"]
+                    if isinstance(err_, dict):
+                        inner = err_.get("caused_by") or {}
+                        reason = f"{err_.get('type')}: {err_.get('reason')}"
                         if inner.get("reason"):
                             reason += f" (caused by {inner.get('type')}: {inner.get('reason')})"
                     else:
-                        reason = str(err)
+                        reason = str(err_)
                     raise JobError(f"task {task_id} ended with error: {reason}")
                 return task
-            self.hard_stop.wait(self.args.poll_interval)
+        finally:
+            with self.lock:
+                self.task_jobs.pop(task_id, None)
 
     def _verify(self, job: Job, task: dict[str, Any], log: JobLog) -> list[str]:
         c = task_counts(task)
@@ -837,9 +991,9 @@ class Runner:
             reasons.append(f"task was cancelled on the cluster: {response['canceled']}")
         if response.get("timed_out"):
             reasons.append("task timed out")
-        processed = c["created"] + c["updated"] + c["noops"] + c["deleted"] + c["version_conflicts"]
-        if processed != c["total"]:
-            reasons.append(f"created+updated+noops+deleted+conflicts={processed} != total={c['total']}")
+        processed_ = c["created"] + c["updated"] + c["noops"] + c["deleted"] + c["version_conflicts"]
+        if processed_ != c["total"]:
+            reasons.append(f"created+updated+noops+deleted+conflicts={processed_} != total={c['total']}")
         kind = self.plan[job.key].get("dest_kind")
         if c["version_conflicts"] and kind == "data_stream":
             # op_type=create into an append-only target: a conflict means the doc is already there.
@@ -860,6 +1014,91 @@ class Runner:
                 if dest_count < source_count:
                     reasons.append(f"destination has {dest_count} docs, source had {source_count}")
         return reasons
+
+    # ---- shared poller (one task listing per interval for every running job)
+    def _poller(self) -> None:
+        last_stats = 0.0
+        while True:
+            try:
+                tasks: dict[str, dict[str, int]] | None = self.cluster.list_reindex_tasks()
+                err: BaseException | None = None
+            except Exception as e:  # noqa: BLE001 - reported to the waiting jobs
+                tasks, err = None, e
+            with self.poll_cv:
+                if tasks is not None:
+                    self.poll_tasks = tasks
+                self.poll_error = err
+                self.poll_gen += 1
+                self.poll_cv.notify_all()
+            if tasks is not None:
+                with self.lock:
+                    for tid, key in self.task_jobs.items():
+                        if tid in tasks and key in self.views:
+                            self.views[key].counts = tasks[tid]
+            if not self.args.no_cluster_stats and time.monotonic() - last_stats >= 30:
+                last_stats = time.monotonic()
+                self._fetch_cluster_stats()
+            if self.poll_stop.wait(self.args.poll_interval):
+                return
+
+    def _fetch_cluster_stats(self) -> None:
+        try:
+            health = self.cluster.health()
+            pool = self.cluster.write_pool()
+        except Exception as e:  # noqa: BLE001 - display only
+            with self.lock:
+                self.cluster_stats["error"] = describe(e)
+            return
+        rejected = sum(int(r.get("rejected") or 0) for r in pool)
+        if self.rejected_base is None:
+            self.rejected_base = rejected
+        with self.lock:
+            self.cluster_stats.update(
+                status=health.get("status"), data_nodes=health.get("number_of_data_nodes"),
+                pending=health.get("number_of_pending_tasks"),
+                shards_pct=health.get("active_shards_percent_as_number"),
+                write_active=sum(int(r.get("active") or 0) for r in pool),
+                write_queue=sum(int(r.get("queue") or 0) for r in pool),
+                write_rejected=rejected - self.rejected_base, nodes=len(pool),
+                ts=time.monotonic(), error=None)
+
+    # ---- keyboard (dashboard only)
+    def _key_reader(self) -> None:
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            while not self.keys_stop.is_set():
+                ready, _, _ = select.select([fd], [], [], 0.25)
+                if ready:
+                    ch = os.read(fd, 1).decode(errors="ignore")
+                    if ch:
+                        self.keys.put(ch)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+    def _handle_keys(self) -> None:
+        while True:
+            try:
+                ch = self.keys.get_nowait()
+            except queue.Empty:
+                return
+            if ch == "q" and not self.soft_stop.is_set():
+                self.soft_stop.set()
+                LOG.warning("q pressed: no new jobs will start; running jobs continue", extra={"event": "soft_stop"})
+            elif ch == "Q" and not self.hard_stop.is_set():
+                self.soft_stop.set()
+                self.hard_stop.set()
+                LOG.warning("Q pressed: cancelling running tasks", extra={"event": "hard_stop"})
+            elif ch in ("-", "_") and self.max_active > 1:
+                self.max_active -= 1
+                LOG.info("concurrency lowered to %d job(s)", self.max_active, extra={"event": "slots"})
+            elif ch in ("+", "=") and self.max_active < self.POOL_CAP:
+                self.max_active += 1
+                LOG.info("concurrency raised to %d job(s)", self.max_active, extra={"event": "slots"})
+            elif ch == "p":
+                self.paused = not self.paused
+                LOG.warning("launching %s", "paused" if self.paused else "resumed", extra={"event": "pause"})
 
     # ---- bookkeeping
     def _record(self, key: str, flush: bool = False, **fields: Any) -> None:
@@ -903,6 +1142,17 @@ class Runner:
     def planned_docs(self) -> int:
         """Docs this run still intends to process (held jobs drop out after a soft stop)."""
         with self.lock:
+            # _cat docs.count includes nested docs; once enough jobs finished, scale the
+            # remaining estimates by the observed ratio of real count to _cat count.
+            est = real = 0
+            n = 0
+            for j in self.jobs:
+                if self.results.get(j.key) == "done":
+                    sc = int(self.state.job(j.key).get("source_count") or 0)
+                    pc = self.plan[j.key].get("count", 0)
+                    if sc and pc:
+                        est, real, n = est + pc, real + sc, n + 1
+            ratio = (real / est) if n >= 3 and est else 1.0
             total = 0
             for j in self.jobs:
                 r = self.results.get(j.key)
@@ -915,13 +1165,15 @@ class Runner:
                 live_total = (v.counts or {}).get("total", 0) if v and v.counts else 0
                 if r in ("done", "failed") and live_total:
                     total += live_total
+                elif started and (live_total or (v and v.source_count)):
+                    total += max(live_total, v.source_count if v else 0)
                 else:
-                    total += max(self.plan[j.key].get("count", 0), live_total)
+                    total += int(self.plan[j.key].get("count", 0) * ratio)
             return total
 
-    def rate(self, window: float = 30.0) -> float:
-        now = time.monotonic()
-        self.samples.append((now, self.docs_done()))
+    def _window_rate(self, now: float, window: float) -> float:
+        if not self.samples:
+            return 0.0
         old = self.samples[0]
         for s in self.samples:
             if now - s[0] <= window:
@@ -932,62 +1184,159 @@ class Runner:
         dt = now - old[0]
         return (self.samples[-1][1] - old[1]) / dt if dt > 0 else 0.0
 
+    def history(self, cols: int, bucket: float = 10.0) -> list[float]:
+        """docs/s per bucket for the last ``cols`` buckets, oldest first."""
+        if len(self.samples) < 2:
+            return [0.0] * cols
+        now = self.samples[-1][0]
+        pts = list(self.samples)
+
+        def docs_at(t: float) -> int | None:
+            best = None
+            for s in pts:
+                if s[0] <= t:
+                    best = s
+                else:
+                    break
+            return best[1] if best else None
+
+        out: list[float] = []
+        for i in range(cols - 1, -1, -1):
+            end = now - i * bucket
+            a, b = docs_at(end - bucket), docs_at(end)
+            out.append(max(0.0, (b - a) / bucket) if a is not None and b is not None else 0.0)
+        return out
+
+    def stats(self) -> dict[str, Any]:
+        """One consistent set of progress numbers for the dashboard and the plain progress line."""
+        now = time.monotonic()
+        planned = self.planned_docs()
+        done = self.docs_done()
+        if planned:
+            done = min(done, planned)
+        if not self.samples or now - self.samples[-1][0] >= 0.5:
+            self.samples.append((now, done))
+        recent = self._window_rate(now, 60.0)
+        with self.lock:
+            starts = [v.started_at for v in self.views.values() if v.started_at]
+        active_secs = now - min(starts) if starts else 0.0
+        avg = done / active_secs if active_secs > 1 else 0.0
+        warm = active_secs >= 300 or (planned > 0 and done / planned >= 0.05)
+        eta_rate = avg if (warm and avg > 0) else recent
+        if eta_rate > 0:
+            if self.rate_smooth <= 0:
+                self.rate_smooth = eta_rate
+            else:
+                dt = max(now - self.rate_ts, 0.0)
+                alpha = 1 - math.exp(-dt / 60.0)   # one-minute time constant
+                self.rate_smooth += alpha * (eta_rate - self.rate_smooth)
+            self.rate_ts = now
+        remaining = max(planned - done, 0)
+        eta_s: float | None
+        if planned and not remaining:
+            eta_s = 0.0
+        elif self.rate_smooth > 0 and remaining:
+            eta_s = remaining / self.rate_smooth
+        else:
+            eta_s = None
+        finish = datetime.now().astimezone() + timedelta(seconds=eta_s) if eta_s is not None else None
+        return {"planned": planned, "done": done, "pct": (done / planned * 100) if planned else 0.0,
+                "recent": recent, "avg": avg, "eta_s": eta_s, "finish": finish, "warm": warm,
+                "elapsed": now - self.t0}
+
     # ---- rendering
     def _mode_text(self) -> Text:
         a = self.args
         if self.hard_stop.is_set():
-            return Text("CANCELLING running tasks", style="bold red")
+            return Text("CANCELLING", style="bold red")
         if self.soft_stop.is_set():
-            return Text("STOPPING: finishing running jobs, starting no more", style="bold yellow")
+            return Text("STOPPING", style="bold yellow")
+        if self.paused:
+            return Text("PAUSED", style="bold yellow")
         if a.delete_source:
-            return Text("DELETE SOURCE after verification", style="bold red")
+            return Text("DELETE SOURCE", style="bold red")
         return Text("keep sources", style="green")
 
-    def render(self, ring: RingHandler) -> Group:
+    def render(self, ring: RingHandler) -> Layout | Group:
         a = self.args
+        st = self.stats()
         t = self.tally()
         with self.lock:
             active = {k: v for k, v in self.views.items() if k not in self.results}
+            cs = dict(self.cluster_stats)
         finished = sum(t.values())
-        planned = self.planned_docs()
-        docs_done = min(self.docs_done(), planned) if planned else self.docs_done()
-        rate = self.rate()
-        eta_rate = self.rate(120.0)
-        eta = fmt_eta((planned - docs_done) / eta_rate) if eta_rate > 0 and planned > docs_done else "--"
-        pct = (docs_done / planned * 100) if planned else 0.0
-        width = self.console.size.width
-        height = self.console.size.height
+        width, height = self.console.size.width, self.console.size.height
+        eta = fmt_eta(st["eta_s"]) if st["eta_s"] is not None else ("warming up" if st["done"] == 0 else "--")
+        finish = fmt_finish(st["finish"]) if st["finish"] else "--"
 
-        title = Text.assemble(
-            (f"{self.cluster_name}", "bold"), f" @ {a.host}:{a.port}  ·  ",
-            (Path(str(a.list)).name, "bold"), f"  ·  {a.workers} worker(s), slices={a.slices}",
-            f", rps={a.requests_per_second:g}" if a.requests_per_second > 0 else "", "  ·  ", self._mode_text())
-        hdr = Table.grid(padding=(0, 2))
-        hdr.add_column(style="bold cyan", justify="right")
-        hdr.add_column()
-        hdr.add_column(style="bold cyan", justify="right")
-        hdr.add_column()
-        hdr.add_column(style="bold cyan", justify="right")
-        hdr.add_column()
-        hdr.add_row("Docs", Text.assemble((f"{pct:5.1f}%", "bold"), f"  {docs_done:,} / {planned:,}"),
-                    "Rate", f"{rate:,.0f} docs/s", "ETA", eta)
-        hdr.add_row("Indices", f"{finished}/{len(self.jobs)}",
-                    "Elapsed", fmt_secs(time.monotonic() - self.t0),
-                    "Deleted", str(self.deleted) if a.delete_source else "-")
+        # header
+        hdr = Table.grid(expand=True)
+        hdr.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
+        hdr.add_column(justify="right", no_wrap=True)
+        left = Text.assemble((str(self.cluster_name), "bold"), f" @ {a.host}:{a.port}  ·  ",
+                             (Path(str(a.list)).name, "bold"), f"  ·  {len(self.jobs)} jobs  ·  ", self._mode_text())
+        right = Text.assemble(datetime.now().strftime("%H:%M:%S"), ("   up ", "dim"), fmt_secs(st["elapsed"]))
+        hdr.add_row(left, right)
+        header = Panel(hdr, border_style="cyan", padding=(0, 1))
+
+        # progress box
+        compact = height < 30
+        prog = Table.grid(expand=True, padding=(0, 1))
+        prog.add_column(no_wrap=True)
+        prog.add_column(ratio=1)
+        prog.add_column(justify="right", no_wrap=True)
+        prog.add_row(Text(f"{st['pct']:5.1f}%", style="bold"),
+                     ProgressBar(total=max(st["planned"], 1), completed=st["done"], width=None, **BAR_STYLE),
+                     f"{st['done']:,} / {st['planned']:,} docs")
+        line2 = Text.assemble(("now ", "dim"), f"{st['recent']:,.0f}/s   ", ("avg ", "dim"), f"{st['avg']:,.0f}/s   ",
+                              ("ETA ", "dim"), (eta, "bold"), ("   finishes ", "dim"), (finish, "bold"),
+                              no_wrap=True, overflow="ellipsis")
+        graph_cols = max(20, int(width * 0.6) - 16)
+        hist = self.history(graph_cols)
+        rows = 1 if compact else 2
+        graph = sparkline(hist, rows=rows)
+        label = Text.assemble(("docs/s · last ", "dim"), f"{graph_cols * 10 // 60} min",
+                              ("   peak ", "dim"), f"{max(hist):,.0f}/s")
         counters = Text.assemble(
-            ("done ", "green"), f"{t['done']}   ", ("failed ", "red"), f"{t['failed'] + t['lost']}   ",
-            ("held ", "yellow"), f"{t['held'] + t['cancelled']}   ", ("skipped ", "dim"), f"{t['skipped']}   ",
-            ("running ", "cyan"), f"{len(active)}")
-        overall = Table.grid(padding=(0, 1), expand=True)
-        overall.add_column(ratio=1)
-        overall.add_column(justify="right")
-        overall.add_row(ProgressBar(total=max(planned, 1), completed=docs_done, width=None, **BAR_STYLE), counters)
-        header = Panel(Group(hdr, overall), title=title, title_align="left", border_style="cyan")
+            ("indices ", "dim"), f"{finished}/{len(self.jobs)}  ", ("done ", "green"), f"{t['done']} ",
+            ("fail ", "red"), f"{t['failed'] + t['lost']} ", ("held ", "yellow"), f"{t['held'] + t['cancelled']} ",
+            ("skip ", "dim"), f"{t['skipped']} ", ("run ", "cyan"), f"{len(active)}",
+            (f" del {self.deleted}" if a.delete_source else ""), ("  slots ", "dim"),
+            f"{len(active)}/{self.max_active}", overflow="ellipsis", no_wrap=True)
+        parts: list[Any] = [prog, line2] + ([] if compact else [Text("")]) + graph + [label, counters]
+        progress = Panel(Group(*parts), title="Progress", title_align="left", border_style="blue", padding=(0, 1))
 
-        problems_rows = len(ring.problems)
-        events_rows = len(ring.buf) or 1
-        overhead = 4 + 2 + 3 + (events_rows + 2) + (problems_rows + 2 if problems_rows else 0) + 1
-        max_rows = max(3, height - overhead - 2)
+        # cluster box
+        cl = Table.grid(padding=(0, 1), expand=True)
+        cl.add_column(style="dim", no_wrap=True, min_width=10, max_width=10)
+        cl.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
+        if a.no_cluster_stats:
+            cl.add_row("stats", Text("off (--no-cluster-stats)", style="dim"))
+        elif cs.get("error"):
+            cl.add_row("stats", Text(str(cs["error"])[:60], style="red"))
+        elif cs.get("status"):
+            status = str(cs["status"]).upper()
+            cl.add_row("health", Text.assemble((status, {"GREEN": "green", "YELLOW": "yellow"}.get(status, "red")),
+                                                f"  nodes {cs.get('data_nodes', '?')}  pending {cs.get('pending', '?')}"))
+            rej = int(cs.get("write_rejected") or 0)
+            cl.add_row("write pool", Text.assemble(f"active {cs.get('write_active', 0)}  queue {cs.get('write_queue', 0)}  ",
+                                                    ("rej ", "dim"), (f"+{rej}", "bold red" if rej else "green"),
+                                                    (f"  {cs.get('nodes', 0)}n", "dim")))
+            age = time.monotonic() - float(cs.get("ts") or time.monotonic())
+            cl.add_row("shards", f"{cs.get('shards_pct', '?')}% active  {int(age)}s ago")
+        else:
+            cl.add_row("stats", Text("waiting for first sample", style="dim"))
+        if not compact:
+            cl.add_row("", "")
+        cl.add_row("keys", Text.assemble(("q", "bold"), " stop ", ("Q", "bold"), " cancel ", ("-/+", "bold"),
+                                          " slots ", ("p", "bold"), " pause"))
+        cluster_panel = Panel(cl, title="Cluster", title_align="left", border_style="green", padding=(0, 1))
+
+        # jobs box
+        top_size = 7 if compact else 9
+        events_size = 5 if compact else 7
+        show_problems = height >= 34
+        jobs_rows = max(1, height - 3 - top_size - events_size - 1 - (6 if show_problems else 0) - 4)
         jobs = Table(box=box.SIMPLE_HEAD, expand=True, show_edge=False, pad_edge=False)
         jobs.add_column("Source → Destination", ratio=3, min_width=24, no_wrap=True, overflow="ellipsis")
         if width >= 120:
@@ -996,62 +1345,100 @@ class Runner:
         jobs.add_column("Docs", justify="right", no_wrap=True)
         jobs.add_column("Progress", ratio=2, min_width=10)
         jobs.add_column("Rate", justify="right", no_wrap=True)
+        jobs.add_column("ETA", justify="right", no_wrap=True)
         jobs.add_column("Elapsed", justify="right", no_wrap=True)
         phase_style = {"reindexing": "cyan", "verifying": "yellow", "deleting": "bold red",
-                       "re-attaching": "magenta", "starting": "magenta", "creating": "magenta"}
-        rows = sorted(active.items(), key=lambda kv: kv[1].started_at or 1e18)
-        for key, v in rows[:max_rows]:
+                       "re-attaching": "magenta", "starting": "magenta", "creating": "magenta", "tuning": "magenta"}
+        rows_ = sorted(active.items(), key=lambda kv: kv[1].started_at or 1e18)
+        shown_rows = rows_[:jobs_rows - 1] if len(rows_) > jobs_rows else rows_
+        for key, v in shown_rows:
             c = v.counts or {}
             got = processed(c)
             tot = c.get("total") or v.source_count
             elapsed = time.monotonic() - v.started_at if v.started_at else 0
+            rate = got / elapsed if elapsed > 1 else 0.0
+            job_eta = fmt_eta((tot - got) / rate) if rate > 0 and tot > got else "-"
             cells: list[Any] = [Text(key.replace(":", " → ", 1), overflow="ellipsis", no_wrap=True)]
             if width >= 120:
                 cells.append(Text((v.task or "-").rsplit(":", 1)[-1]))
             cells += [Text(v.phase, style=phase_style.get(v.phase, "")),
                       f"{got:,} / {tot:,}",
                       ProgressBar(total=max(tot, 1), completed=min(got, tot), width=None, **BAR_STYLE),
-                      f"{got / elapsed:,.0f}/s" if elapsed > 1 else "-",
+                      f"{rate:,.0f}/s" if rate else "-", job_eta,
                       fmt_secs(elapsed) if v.started_at else "-"]
             jobs.add_row(*cells)
-        if len(rows) > max_rows:
-            jobs.add_row(Text(f"+ {len(rows) - max_rows} more running", style="dim"),
+        if len(rows_) > len(shown_rows):
+            jobs.add_row(Text(f"+ {len(rows_) - len(shown_rows)} more running", style="dim"),
                          *[""] * (len(jobs.columns) - 1))
         if not active:
-            jobs.add_row(Text("no active jobs", style="dim"), *[""] * (len(jobs.columns) - 1))
-        jobs_panel = Panel(jobs, title=f"Active jobs ({len(active)})", title_align="left", border_style="blue")
+            jobs.add_row(Text("no active jobs" + (" (paused)" if self.paused else ""), style="dim"),
+                         *[""] * (len(jobs.columns) - 1))
+        jobs_panel = Panel(jobs, title=f"Active jobs ({len(active)})", title_align="left", border_style="blue",
+                           padding=(0, 1))
 
-        def events_table(rows_: list[tuple[float, int, str, str]], empty: str) -> Table:
+        def events_table(rows__: list[tuple[float, int, str, str]], empty: str) -> Table:
             ev = Table.grid(padding=(0, 1), expand=True)
             ev.add_column(style="dim", no_wrap=True, min_width=8)
             ev.add_column(no_wrap=True, min_width=4)
             ev.add_column(style="magenta", no_wrap=True, min_width=6, max_width=32, overflow="ellipsis")
             ev.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
-            for ts, lvl, jobkey, msg in rows_:
+            for ts, lvl, jobkey, msg in rows__:
                 style = "red" if lvl >= logging.ERROR else ("yellow" if lvl >= logging.WARNING else "")
                 ev.add_row(datetime.fromtimestamp(ts).strftime("%H:%M:%S"),
                            Text({logging.ERROR: "ERR", logging.WARNING: "WARN"}.get(lvl, "INFO"), style=style),
                            Text(jobkey.split(":", 1)[0]), Text(msg, style=style))
-            if not rows_:
+            if not rows__:
                 ev.add_row("", "", "", Text(empty, style="dim"))
             return ev
 
-        parts: list[Any] = [header, jobs_panel]
-        if ring.problems:
-            parts.append(Panel(events_table(list(ring.problems), ""), title=f"Problems ({len(ring.problems)} recent)",
-                               title_align="left", border_style="red"))
-        parts.append(Panel(events_table(list(ring.buf), "no events yet"), title="Recent events",
-                           title_align="left", border_style="magenta"))
+        problems_panel = Panel(events_table(list(ring.problems)[-4:], "none so far"),
+                               title=f"Problems ({len(ring.problems)} recent)", title_align="left",
+                               border_style="red" if ring.problems else "dim", padding=(0, 1))
+        events_panel = Panel(events_table(list(ring.buf)[-(events_size - 2):], "no events yet"),
+                             title="Recent events", title_align="left", border_style="magenta", padding=(0, 1))
         if self.hard_stop.is_set():
             foot = "Cancelling running tasks; the run ends when they acknowledge."
         elif self.soft_stop.is_set():
-            foot = "Ctrl+C again: cancel the running tasks (they go back to pending)."
+            foot = "Stopping: running jobs finish, nothing new starts.  Q or Ctrl+C again cancels them."
         else:
-            foot = "Ctrl+C once: finish running jobs, start no more.  Twice: cancel running tasks."
-        parts.append(Text(foot, style="dim"))
-        return Group(*parts)
+            foot = "q stop · Q cancel · -/+ concurrency · p pause · Ctrl+C once/twice = q/Q"
+        footer = Text(foot, style="dim")
+
+        if height < 24:
+            return Group(header, jobs_panel, footer)
+        layout = Layout()
+        sections = [Layout(name="header", size=3), Layout(name="top", size=top_size), Layout(name="jobs", ratio=1)]
+        if show_problems:
+            sections.append(Layout(name="problems", size=6))
+        sections += [Layout(name="events", size=events_size), Layout(name="footer", size=1)]
+        layout.split_column(*sections)
+        layout["top"].split_row(Layout(name="progress", ratio=3), Layout(name="cluster", ratio=2, minimum_size=36))
+        layout["header"].update(header)
+        layout["progress"].update(progress)
+        layout["cluster"].update(cluster_panel)
+        layout["jobs"].update(jobs_panel)
+        if show_problems:
+            layout["problems"].update(problems_panel)
+        layout["events"].update(events_panel)
+        layout["footer"].update(footer)
+        return layout
 
     # ---- orchestration
+    def _dispatch(self, pool: ThreadPoolExecutor, pending: deque[Job], futures: dict[Future[str], Job]) -> None:
+        if self.soft_stop.is_set():
+            while pending:
+                j = pending.popleft()
+                LOG.info("not started: stop requested", extra={"job": j.key, "event": "held"})
+                self._finish(j.key, "held")
+            return
+        if self.paused:
+            return
+        running = sum(1 for f in futures if not f.done())
+        while pending and running < self.max_active:
+            j = pending.popleft()
+            futures[pool.submit(self.run_job, j)] = j
+            running += 1
+
     def run(self, tui: bool, ring: RingHandler) -> int:
         runnable = [j for j in self.jobs if self.plan[j.key]["action"] not in ("skip", "error")]
         for j in self.jobs:
@@ -1059,34 +1446,63 @@ class Runner:
                 with self.lock:
                     self.results[j.key] = "skipped"
                     self.views[j.key] = JobView(phase="skipped")
-        with ThreadPoolExecutor(max_workers=self.args.workers, thread_name_prefix="job") as pool:
-            futures: list[Future[str]] = [pool.submit(self.run_job, j) for j in runnable]
-            last_report = time.monotonic()
-            live_ok = tui
-            if tui:
-                try:
-                    with Live(self.render(ring), console=self.console, refresh_per_second=4) as live:
-                        while not all(f.done() for f in futures):
-                            time.sleep(0.25)
+        pending: deque[Job] = deque(runnable)
+        futures: dict[Future[str], Job] = {}
+        poller = threading.Thread(target=self._poller, name="poller", daemon=True)
+        poller.start()
+        keys_thread: threading.Thread | None = None
+        if tui and sys.stdin.isatty() and termios is not None:
+            keys_thread = threading.Thread(target=self._key_reader, name="keys", daemon=True)
+            keys_thread.start()
+
+        def busy() -> bool:
+            return bool(pending) or any(not f.done() for f in futures)
+
+        try:
+            with ThreadPoolExecutor(max_workers=self.POOL_CAP, thread_name_prefix="job") as pool:
+                last_report = time.monotonic()
+                live_ok = tui
+                if tui:
+                    try:
+                        with Live(self.render(ring), console=self.console, screen=True, refresh_per_second=2,
+                                  vertical_overflow="crop") as live:
+                            while busy():
+                                self._handle_keys()
+                                self._dispatch(pool, pending, futures)
+                                time.sleep(0.5)
+                                live.update(self.render(ring))
                             live.update(self.render(ring))
-                        live.update(self.render(ring))
-                except Exception:  # noqa: BLE001 - a dashboard bug must not take the run down
-                    LOG.exception("dashboard failed; continuing without it", extra={"event": "tui_failed"})
-                    live_ok = False
-            if not live_ok:
-                while not all(f.done() for f in futures):
-                    time.sleep(0.5)
-                    if time.monotonic() - last_report >= 30:
-                        last_report = time.monotonic()
-                        t = self.tally()
-                        planned, done = self.planned_docs(), self.docs_done()
-                        r = self.rate(120.0)
-                        LOG.info("progress: %d/%d indices done, %d failed, %d running, %s/%s docs, %.0f docs/s, ETA %s",
-                                 t["done"], len(self.jobs), t["failed"] + t["lost"],
-                                 len(self.views) - len(self.results), f"{done:,}", f"{planned:,}", r,
-                                 fmt_eta((planned - done) / r) if r > 0 and planned > done else "--",
-                                 extra={"event": "progress"})
-        for j, f in zip(runnable, futures):
+                    except Exception:  # noqa: BLE001 - a dashboard bug must not take the run down
+                        LOG.exception("dashboard failed; continuing without it", extra={"event": "tui_failed"})
+                        live_ok = False
+                if not live_ok:
+                    while busy():
+                        self._dispatch(pool, pending, futures)
+                        time.sleep(0.5)
+                        if time.monotonic() - last_report >= 30:
+                            last_report = time.monotonic()
+                            st = self.stats()
+                            t = self.tally()
+                            LOG.info("progress: %d/%d indices done, %d failed, %d running, %s/%s docs (%.1f%%), "
+                                     "now %.0f docs/s, avg %.0f docs/s, ETA %s, finishes %s",
+                                     t["done"], len(self.jobs), t["failed"] + t["lost"],
+                                     sum(1 for f in futures if not f.done()), f"{st['done']:,}", f"{st['planned']:,}",
+                                     st["pct"], st["recent"], st["avg"],
+                                     fmt_eta(st["eta_s"]) if st["eta_s"] is not None else "--",
+                                     fmt_finish(st["finish"]) if st["finish"] else "--",
+                                     extra={"event": "progress", "counts": {"total": st["planned"]},
+                                            "elapsed_s": round(st["elapsed"], 1),
+                                            "eta_s": round(st["eta_s"], 1) if st["eta_s"] is not None else None,
+                                            "finish_at": st["finish"].isoformat(timespec="minutes") if st["finish"] else None,
+                                            "rate_recent": round(st["recent"]), "rate_avg": round(st["avg"])})
+        finally:
+            self.poll_stop.set()
+            self.keys_stop.set()
+            with self.poll_cv:
+                self.poll_cv.notify_all()
+            if keys_thread:
+                keys_thread.join(timeout=2)
+        for f, j in futures.items():
             exc = f.exception()
             if exc is not None:
                 LOG.error("job crashed outside its handler: %s", describe(exc),
@@ -1115,6 +1531,12 @@ def preflight(cluster: Cluster, jobs: list[Job], state: State, args: argparse.Na
                              "note": "task permissions missing"}
         return plan, problems
     snap = cluster.snapshot()
+    try:
+        health = cluster.health()
+    except os_exc.OpenSearchException:
+        health = {}
+    data_nodes = int(health.get("number_of_data_nodes") or 1)
+    args.cluster_health = health
 
     def resolve(name: str) -> tuple[str, str]:
         if name in snap.data_streams:
@@ -1135,7 +1557,7 @@ def preflight(cluster: Cluster, jobs: list[Job], state: State, args: argparse.Na
         st = state.job(job.key)
         status = st.get("status", "pending")
         row: dict[str, Any] = {"status": status, "count": 0, "dest_kind": None, "action": "reindex", "note": "",
-                               "create": None, "template": None}
+                               "create": None, "template": None, "shards": None}
         plan[job.key] = row
         if status == "done":
             row.update(action="skip", note="done" + (" (source deleted)" if st.get("deleted_source") else ""))
@@ -1186,6 +1608,19 @@ def preflight(cluster: Cluster, jobs: list[Job], state: State, args: argparse.Na
                 row["template"] = tpl["name"] if tpl else None
                 row["note"] = (f"create {kind.replace('_', ' ')} (template {tpl['name']})" if tpl
                                else "create plain index (no template!)")
+                src_row = snap.indices.get(job.source) or {}
+                src_bytes = int(src_row.get("store.size") or 0)
+                if kind == "index" and args.dest_shards:
+                    if args.dest_shards == "auto":
+                        if src_bytes >= 5 * 1024 ** 3:
+                            row["shards"] = max(1, min(data_nodes, 8))
+                    else:
+                        row["shards"] = int(args.dest_shards)
+                    if row["shards"]:
+                        row["note"] += f", {row['shards']} primary shards"
+                elif kind == "data_stream" and data_nodes > 1 and (tpl or {}).get("shards", 1) < data_nodes:
+                    row["note"] += (f"; template gives {(tpl or {}).get('shards') or 1} primary, cluster has "
+                                    f"{data_nodes} data nodes: set index.number_of_shards in the template")
             else:
                 if kind == "index" and snap.indices[job.dest].get("status") == "close":
                     raise JobError("destination index is closed")
@@ -1282,13 +1717,24 @@ def writes_table(jobs: list[Job], plan: dict[str, dict[str, Any]], args: argpars
         if p["action"] == "reindex":
             if p.get("create"):
                 tpl = f"  (template {p['template']})" if p.get("template") else "  (no template: dynamic mapping)"
-                row(f"PUT /_data_stream/{j.dest}{tpl}" if p["create"] == "data_stream" else f"PUT /{j.dest}{tpl}",
-                    create_kind)
+                if p["create"] == "data_stream":
+                    row(f"PUT /_data_stream/{j.dest}{tpl}", create_kind)
+                elif p.get("shards"):
+                    row(f"PUT /{j.dest}{tpl}\n{json.dumps({'settings': {'index.number_of_shards': p['shards']}})}",
+                        create_kind)
+                else:
+                    row(f"PUT /{j.dest}{tpl}", create_kind)
                 n_create += 1
+            if args.tune_dest and p.get("dest_kind") in ("index", "data_stream"):
+                idx = j.dest if p.get("dest_kind") == "index" else f"<write index of {j.dest}>"
+                row(f"PUT /{idx}/_settings  {json.dumps({'index': {'number_of_replicas': 0, 'refresh_interval': '-1'}})}"
+                    "  (--tune-dest, before the reindex)", write)
+                row(f"PUT /{idx}/_settings  (restore the previous replicas and refresh_interval after verification)",
+                    write)
             row(f"POST /{j.source}/_refresh  (exact doc count before starting)", harmless)
             path, body = cluster.reindex_request(j, slices=args.slices, rps=args.requests_per_second,
                                                  conflicts=args.conflicts, require_alias=args.require_alias,
-                                                 dest_kind=p.get("dest_kind"))
+                                                 dest_kind=p.get("dest_kind"), batch_size=args.batch_size)
             row(f"{path}\n{json.dumps(body)}", write)
             n_writes += 1
         if p["action"] in ("reindex", "re-attach") and p.get("dest_kind") in ("index", "data_stream"):
@@ -1375,6 +1821,7 @@ examples:
 
 stopping: Ctrl+C (or SIGTERM) once finishes running jobs and starts no more; twice cancels
 the running tasks (they go back to pending); a third time exits immediately.
+dashboard keys: q stop, Q cancel, - / + lower or raise the number of concurrent jobs, p pause.
 exit codes: 0 all done/skipped, 1 a job failed, 2 configuration/preflight error, 130 interrupted.
 """
 
@@ -1405,6 +1852,17 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     r.add_argument("--requests-per-second", type=float, default=-1,
                    help="throttle passed to _reindex; effectively documents per second per task "
                         "(a batch of 1000 docs waits 1000/N seconds); -1 = unlimited")
+    r.add_argument("--max-total-rate", type=float, default=None, metavar="DOCS_PER_SEC",
+                   help="cap for the whole run: each task is throttled to DOCS_PER_SEC / workers "
+                        "(cannot be combined with --requests-per-second)")
+    r.add_argument("--batch-size", type=int, default=1000,
+                   help="documents per scroll batch (source.size); larger for small docs, smaller for multi-KB docs")
+    r.add_argument("--tune-dest", action="store_true",
+                   help="set replicas 0 and refresh_interval -1 on each destination during its reindex and "
+                        "restore the previous values after verification")
+    r.add_argument("--dest-shards", default=None, metavar="N|auto",
+                   help="primary shards for plain indices the tool creates; auto = number of data nodes "
+                        "(max 8, only for sources of 5 GB or more). Data streams take shards from their template")
     r.add_argument("--conflicts", choices=("abort", "proceed"), default="abort",
                    help="what _reindex does on a version conflict (only reachable with external versioning)")
     r.add_argument("--require-alias", action="store_true", help="fail if a destination is not an alias")
@@ -1418,7 +1876,10 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     r.add_argument("--create-plain", action="store_true",
                    help="allow creating a missing destination that matches no index template, as a plain "
                         "dynamically-mapped index")
-    r.add_argument("--poll-interval", type=float, default=5, help="seconds between task polls")
+    r.add_argument("--poll-interval", type=float, default=10,
+                   help="seconds between task-list polls (one request per interval for all jobs)")
+    r.add_argument("--no-cluster-stats", action="store_true",
+                   help="do not fetch cluster health and write thread-pool stats every 30 s for the dashboard")
     r.add_argument("--poll-grace", type=float, default=300,
                    help="seconds to keep retrying an unreachable cluster before giving up on a job "
                         "(the job stays re-attachable)")
@@ -1444,6 +1905,22 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         p.error("--workers must be >= 1")
     if a.poll_interval <= 0:
         p.error("--poll-interval must be > 0")
+    if a.batch_size < 1:
+        p.error("--batch-size must be >= 1")
+    if a.max_total_rate is not None:
+        if a.requests_per_second != -1:
+            p.error("--max-total-rate and --requests-per-second are mutually exclusive")
+        if a.max_total_rate <= 0:
+            p.error("--max-total-rate must be > 0")
+        a.requests_per_second = max(1.0, a.max_total_rate / a.workers)
+    if a.dest_shards is not None and a.dest_shards != "auto":
+        try:
+            a.dest_shards = str(int(a.dest_shards))
+            if int(a.dest_shards) < 1:
+                raise ValueError
+        except ValueError:
+            p.error("--dest-shards must be a positive integer or 'auto'")
+    a.cluster_health = {}
     if str(a.log_file) in ("", "."):
         a.log_file = None
     if str(a.json_log) in ("", "."):
@@ -1567,6 +2044,9 @@ def main(argv: list[str] | None = None) -> int:
         console.print(Text("nothing to do: every job is already done or skipped.", style="green"))
         return 0
     docs = sum(plan[j.key]["count"] for j in runnable)
+    if args.max_total_rate:
+        console.print(Text(f"rate cap: {args.max_total_rate:,.0f} docs/s total = {args.requests_per_second:,.0f} "
+                           f"docs/s per task across {args.workers} worker(s)", style="dim"))
     if args.delete_source:
         prompt = (f"On {cluster_name}: reindex {len(runnable)} job(s) ({docs:,} docs) with {args.workers} worker(s), "
                   f"then DELETE each source after verification. This cannot be undone.")
@@ -1588,7 +2068,12 @@ def main(argv: list[str] | None = None) -> int:
         state._dirty = True     # persist the plan (pending entries) now that the user confirmed
         state.flush()
         state.start_flusher()
-        runner = Runner(args, cluster, state, jobs, plan, cluster_name, console)
+        h = args.cluster_health or {}
+        seed = {"status": h.get("status"), "data_nodes": h.get("number_of_data_nodes"),
+                "pending": h.get("number_of_pending_tasks"), "shards_pct": h.get("active_shards_percent_as_number"),
+                "write_active": 0, "write_queue": 0, "write_rejected": 0, "nodes": 0,
+                "ts": time.monotonic()} if h.get("status") else {}
+        runner = Runner(args, cluster, state, jobs, plan, cluster_name, console, cluster_stats=seed)
         runner.soft_stop, runner.hard_stop = soft_stop, hard_stop
         LOG.info("run started: %d job(s), workers=%d, delete_source=%s", len(runnable), args.workers,
                  args.delete_source, extra={"event": "run_start"})

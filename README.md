@@ -22,7 +22,8 @@ trust the results on your own data.
 * Checkpoint file: done jobs are skipped, running tasks are re-attached, failed jobs can be retried
 * Verification before any delete: no failures, not cancelled, all docs accounted for, task total matches the source doc count, and (for index destinations) destination count is at least the source count
 * `--workers N` to run several indices at once; each reindex is also sliced by OpenSearch (`slices=auto`)
-* Live dashboard on the console: progress by documents, per-job bars, rate, ETA, recent problems
+* Full-screen live dashboard: progress by documents, throughput graph, per-job bars and ETAs, cluster
+  health and write-pool pressure, recent problems; keys to stop, cancel, pause, or change concurrency
 * Text log and JSON-lines log for tracing specific issues
 * Two-stage stop: Ctrl+C (or SIGTERM) once to stop launching new jobs, twice to cancel the running tasks
 * Preflight that checks every source and destination, and the user's task permissions, before anything starts
@@ -103,13 +104,18 @@ Default is `https://` with certificate verification **off** and the warning sile
 | `--workers N` | `1` | Concurrent indices |
 | `--slices` | `auto` | Passed to `_reindex` |
 | `--requests-per-second` | `-1` (unlimited) | Throttle passed to `_reindex`; effectively documents per second per task |
+| `--max-total-rate N` | off | Cap for the whole run: each task gets `N / workers`. Exclusive with the flag above |
+| `--batch-size` | `1000` | Documents per scroll batch (`source.size`) |
+| `--tune-dest` | off | Replicas 0 and refresh off on each destination during its reindex, restored after verification |
+| `--dest-shards N\|auto` | off | Primary shards for plain indices the tool creates; `auto` = data-node count (max 8, sources of 5 GB or more) |
 | `--conflicts` | `abort` | `proceed` tolerates version conflicts (only reachable with external versioning) |
 | `--require-alias` | off | Fail in preflight if a destination is not an alias |
 | `--delete-source` | off | Delete a source after its job verifies. Refuses alias sources |
 | `--skip-missing` | off | Skip jobs that fail preflight instead of aborting |
 | `--no-create` | off | Do not create missing destinations |
 | `--create-plain` | off | Allow creating a missing destination that matches no template, as a plain dynamically-mapped index |
-| `--poll-interval`, `--poll-grace` | `5`, `300` | Seconds between task polls; seconds to tolerate an unreachable cluster before giving up on a job (it stays re-attachable) |
+| `--poll-interval`, `--poll-grace` | `10`, `300` | Seconds between task-list polls (one request per interval for all jobs); seconds to tolerate an unreachable cluster before giving up on a job (it stays re-attachable) |
+| `--no-cluster-stats` | off | Do not fetch cluster health and write-pool stats every 30 s for the dashboard |
 | `--dry-run` | off | Read-only preflight, plan, and the list of writes a real run would send |
 | `-y`, `--yes` | off | No confirmation prompt |
 | `--state-file`, `--reset-state`, `--retry-failed` | `reindex-state.json` | Checkpoint control |
@@ -267,11 +273,36 @@ fails after verification, the job stays `verified` and the next run retries only
   The file can be bulk-loaded straight into OpenSearch. With `--debug` it also receives every
   HTTP request from opensearch-py and every task poll, and grows quickly.
 
-While jobs run, the console shows the live dashboard: a header with progress by documents,
-rate, ETA and counters; one row per active job; a "Problems" panel with the last warnings and
-errors; and the last few events. The full stream is in the files. The plan table is printed
-before the run and a summary table after it. When stdout is not a terminal (cron, `| tee`),
-or with `--no-tui`, events are printed as plain lines instead, plus a progress line every 30 s.
+### Dashboard
+
+While jobs run, the console switches to a full-screen dashboard (the plan table is printed
+before it and the summary after it, in the normal scrollback):
+
+* **Header**: cluster, list, mode, local clock, elapsed time.
+* **Progress**: percentage and bar by documents, current and average throughput, ETA and the
+  local date and time the run should finish, a throughput graph of the last several minutes,
+  and counters (done, failed, held, skipped, running, deleted, concurrency slots).
+* **Cluster**: health, data nodes, pending cluster tasks, and the write thread pool's active,
+  queued and rejected counts summed across nodes (rejections since the run started are the
+  clearest sign of overload). Two small read-only calls every 30 s; `--no-cluster-stats` turns
+  them off.
+* **Active jobs**: one row per running job with phase, docs, bar, rate, per-job ETA and elapsed.
+* **Problems** and **Recent events**: the last warnings and errors, and the last few log lines.
+
+The dashboard itself never calls the cluster; it only renders the poller's numbers twice a
+second. Keys while it runs: `q` stop launching new jobs, `Q` cancel running tasks, `-` and `+`
+lower or raise the number of jobs allowed to run at once (takes effect as jobs finish), `p`
+pause launching. Ctrl+C once and twice still mean `q` and `Q`.
+
+**ETA.** Throughput is measured as documents processed per second. The ETA uses the run's
+average rate once at least five minutes or 5 % of the documents have passed (before that, the
+recent rate), smoothed with a one-minute time constant, over the documents still planned.
+Estimates for indices that have not started come from `_cat/indices`, which counts nested
+documents too; after three jobs finish, those estimates are scaled by the observed ratio. It
+spills into days and weeks (`~3w 2d`) and shows the finish time in the system timezone.
+
+When stdout is not a terminal (cron, `| tee`), or with `--no-tui`, events are printed as plain
+lines instead, plus a progress line every 30 s with the same rate, ETA and finish time.
 
 With `slices=auto` the parent task's counters stay at 0 until slices finish; the dashboard
 reads progress from the child tasks (`GET _tasks?parent_task_id=<id>&detailed=true` shows the
@@ -279,15 +310,32 @@ same), while `GET _tasks/<id>` on the parent will show 0 until the end.
 
 ## Performance notes
 
-* For big batches, set `number_of_replicas: 0` and `refresh_interval: -1` on the
-  destinations for the duration, then restore them.
-* `--slices auto` parallelises each reindex across the source's shards. Use `--workers` to
-  overlap several indices as well; watch cluster CPU and the write thread pool.
-* `--requests-per-second` throttles if the cluster is serving traffic at the same time. Despite
-  the name it behaves as documents per second per task: each batch of 1000 docs waits `1000 / N`
-  seconds, so `--requests-per-second 5000` is a mild throttle and `2` would take hours per
-  index. The throttle is split across a task's slices, and `--workers N` multiplies the
-  cluster-wide rate by N.
+The tool never reads metrics to adjust itself. These are the static knobs, roughly in order
+of effect:
+
+* **Workers × slices is the real parallelism.** `--slices auto` gives one slice per source
+  shard, and each slice is a scroll plus bulk stream holding a search context. Six workers on
+  3-shard indices is 18 streams. With more than two workers, prefer `--slices 1` or `2`; the
+  parallelism then comes from workers, and slices beyond the shard count add nothing.
+* **Cap the whole run with `--max-total-rate`.** Each task is throttled to `N / workers`
+  documents per second, so the cluster-wide indexing rate stays under N however many
+  workers run. `--requests-per-second` is the same throttle per task, without the division.
+* **`--tune-dest`** sets `number_of_replicas: 0` and `refresh_interval: -1` on each
+  destination's write index just before its reindex and restores the previous values after
+  verification (or on the next run, if interrupted). This is the standard bulk-load setting
+  and usually the largest single speedup. Off by default because it changes the destination.
+* **Primary shards.** Bulk requests are split per primary shard, so a destination with one
+  primary funnels all indexing through one node. For plain indices the tool creates,
+  `--dest-shards N` or `--dest-shards auto` (the data-node count, at most 8, only for sources
+  of 5 GB or more so small indices do not get many tiny shards) sets it at creation; aim for
+  10 to 50 GB per shard. Data streams take their shard count from the index template, so
+  preflight only warns when the template's `number_of_shards` is below the data-node count.
+* **`--batch-size`** is the scroll batch (`source.size`, default 1000). Use 2000 to 5000
+  for small documents and 200 to 500 for multi-KB documents; a bulk request should stay
+  under about 10 MB.
+* **Polling** is one `GET _tasks?actions=*reindex&detailed=true` per `--poll-interval`
+  (default 10 s) for all running jobs, plus one `GET _tasks/<id>` per job when it finishes,
+  and two small calls every 30 s for the cluster box. The dashboard refresh adds nothing.
 * Preflight makes five cluster calls regardless of list length (`_cat/indices`, `_alias`,
   `_data_stream`, `_index_template`, a task-listing probe); plan and summary tables show at
   most 80 rows and hide already-done rows when the list is longer.
