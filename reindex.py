@@ -174,6 +174,10 @@ class Unreachable(JobError):
     """Lost sight of a task that may still be running; keep it re-attachable."""
 
 
+class DeleteRefused(JobError):
+    """The reindex verified but the source must be kept; the job stays verified."""
+
+
 class DryRunViolation(RuntimeError):
     """A write was attempted during a dry run. Never expected."""
 
@@ -718,7 +722,7 @@ class ConsoleNoiseFilter(logging.Filter):
 
 
 class JsonFormatter(logging.Formatter):
-    EXTRA = ("event", "task", "counts", "elapsed_s", "reason")
+    EXTRA = ("event", "task", "counts", "elapsed_s", "reason", "setting", "value")
 
     def format(self, record: logging.LogRecord) -> str:
         doc: dict[str, Any] = {
@@ -1114,6 +1118,10 @@ class Runner:
                 self._record(key, status="pending", finished=utcnow(), note=str(e), task=None)
                 log.warning("%s; job reset to pending", e, extra={"event": "cancelled"})
             result = "cancelled"
+        except DeleteRefused as e:
+            self._record(key, status="verified", note=str(e))
+            log.error("%s", e, extra={"event": "delete_refused", "reason": str(e)})
+            result = "failed"
         except Unreachable as e:
             # Keep status=running and the task id so the next run re-attaches.
             self._record(key, status="running", error=str(e))
@@ -1219,7 +1227,7 @@ class Runner:
         if a.delete_source and not deleted:
             reason = self._delete_guard(key)
             if reason:
-                raise JobError(f"reindex verified but source kept: {reason}")
+                raise DeleteRefused(f"reindex verified but source kept: {reason}")
             if self.hard_stop.is_set():
                 raise Cancelled("stop requested before the source delete")
             self._phase(key, "deleting")
@@ -1246,7 +1254,7 @@ class Runner:
         row = self.plan.get(key) or {}
         kind = row.get("src_kind")
         if kind in ("alias", "data_stream"):
-            return f"source is a {kind.replace('_', ' ')}, not an index"
+            return f"source is {'an' if kind == 'alias' else 'a'} {kind.replace('_', ' ')}, not an index"
         owner = row.get("src_write_index_of")
         if owner:
             return f"source is the write index of data stream {owner!r}; roll it over first"
@@ -1770,8 +1778,8 @@ class Runner:
             cl.add_row("stats", Text("waiting for first sample", style="dim"))
         if not compact:
             cl.add_row("", "")
-        cl.add_row("keys", Text.assemble(("q", "bold"), " stop ", ("Q", "bold"), " cancel ", ("-/+", "bold"),
-                                          " slots ", ("p", "bold"), " pause"))
+        cl.add_row("keys", Text.assemble(("g", "bold"), " graph ", ("z", "bold"), " zone ", ("d", "bold"), " delete ",
+                                          ("t", "bold"), " tune ", ("c", "bold"), " create", overflow="ellipsis", no_wrap=True))
         cluster_panel = Panel(cl, title="Cluster", title_align="left", border_style="green", padding=(0, 1))
 
         # jobs box: as tall as the active jobs need (at least 3 rows, plus 4 for border and
@@ -1781,7 +1789,8 @@ class Runner:
         problems_rows = min(len(ring.problems), 6, avail - 16) if height >= 34 else 0
         show_problems = problems_rows > 0
         problems_size = problems_rows + 2 if show_problems else 0
-        jobs_rows = max(1, min(max(3, len(active)), avail - problems_size - 11))
+        want_rows = max(3, len(active), 13 if self.dialog is not None else 0)
+        jobs_rows = max(1, min(want_rows, avail - problems_size - 11))
         events_size = max(3, avail - problems_size - jobs_rows - 4)
         jobs = Table(box=box.SIMPLE_HEAD, expand=True, show_edge=False, pad_edge=False)
         jobs.add_column("Source → Destination", ratio=3, min_width=24, no_wrap=True, overflow="ellipsis")
@@ -1848,7 +1857,7 @@ class Runner:
             foot = "Stopping: running jobs finish, nothing new starts.  Q or Ctrl+C again cancels them."
         else:
             foot = None
-        footer = Text(foot, style="dim") if foot else Text.assemble(self.key_help(), ("· Ctrl+C once/twice = q/Q", "dim"))
+        footer = Text(foot, style="dim") if foot else Text.assemble(self.key_help(), ("· ^C = q/Q", "dim"))
 
         if height < 24:
             return Group(header, jobs_panel, footer)
@@ -2038,7 +2047,8 @@ def preflight(cluster: Cluster, jobs: list[Job], state: State, args: argparse.Na
             if src_kind == "index" and snap.indices[job.source].get("status") == "close":
                 raise JobError("source index is closed")
             if args.delete_source and src_kind in ("alias", "data_stream"):
-                raise JobError(f"source is a {src_kind.replace('_', ' ')}; refusing with --delete-source")
+                raise JobError(f"source is {'an' if src_kind == 'alias' else 'a'} {src_kind.replace('_', ' ')}; "
+                               "refusing with --delete-source")
             if args.delete_source and src_kind == "index":
                 owner = row["src_write_index_of"]
                 if owner:
@@ -2281,7 +2291,8 @@ examples:
 
 stopping: Ctrl+C (or SIGTERM) once finishes running jobs and starts no more; twice cancels
 the running tasks (they go back to pending); a third time exits immediately.
-dashboard keys: q stop, Q cancel, - / + lower or raise the number of concurrent jobs, p pause.
+dashboard keys: q stop, Q cancel, - / + lower or raise the number of concurrent jobs, p pause,
+g / G graph window, z timezone, d / t / c toggle delete-source, tune-dest and create-missing.
 exit codes: 0 all done/skipped, 1 a job failed, 2 configuration/preflight error, 130 interrupted.
 """
 

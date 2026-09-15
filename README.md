@@ -337,7 +337,8 @@ pause launching, `d` toggle `--delete-source` (turning it on opens a confirmatio
 `y` confirms; applies to jobs that have not reached the delete step yet), `t` toggle
 `--tune-dest` for jobs that have not started, `c` toggle creating missing destinations (jobs
 planned to create one fail cleanly at start while it is off). The footer shows each toggle's
-current state. Ctrl+C once and twice still mean `q` and `Q`.
+current state. `g` and `G` cycle the throughput graph window (15m to 72h), `z` opens the
+timezone picker. Ctrl+C once and twice still mean `q` and `Q`.
 
 **ETA.** Throughput is measured as documents processed per second. The ETA uses the run's
 average rate once at least five minutes or 5 % of the documents have passed (before that, the
