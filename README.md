@@ -121,6 +121,7 @@ Default is `https://` with certificate verification **off** and the warning sile
 | `--state-file`, `--reset-state`, `--retry-failed` | `reindex-state.json` | Checkpoint control |
 | `--log-file`, `--json-log` | `reindex.log`, `reindex.jsonl` | Log files. Pass `''` to disable |
 | `--no-tui`, `--debug` | off | Plain output; log every poll and HTTP request to the log files |
+| `--timezone ZONE` | `America/Chicago` | Zone for the dashboard clock and finish times: an IANA name, `utc` or `local`. Env: `REINDEX_TZ` |
 
 ### The list file
 
@@ -303,7 +304,10 @@ average rate once at least five minutes or 5 % of the documents have passed (bef
 recent rate), smoothed with a one-minute time constant, over the documents still planned.
 Estimates for indices that have not started come from `_cat/indices`, which counts nested
 documents too; after three jobs finish, those estimates are scaled by the observed ratio. It
-spills into days and weeks (`~3w 2d`) and shows the finish time in the system timezone.
+spills into days and weeks (`~3w 2d`) and shows the finish time, like the header clock, in US
+Central time by default (`--timezone`, env `REINDEX_TZ`: any IANA zone name, or the aliases `utc`
+and `local` for the system zone). The `z` key opens a picker with the US zones, UTC and local,
+each with its current time, plus a line to type any other zone name.
 
 When stdout is not a terminal (cron, `| tee`), or with `--no-tui`, events are printed as plain
 lines instead, plus a progress line every 30 s with the same rate, ETA and finish time.

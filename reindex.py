@@ -709,6 +709,29 @@ def sparkline(values: list[float], rows: int = 2) -> list[Text]:
     return lines
 
 
+DEFAULT_TZ = "America/Chicago"
+
+
+def resolve_tz(name: str) -> tuple[str, ZoneInfo | None]:
+    """Map a zone name or alias to (resolved name, ZoneInfo); 'local' is the system zone (None).
+
+    Raises KeyError (zoneinfo's not-found error) or ValueError for names that do not resolve.
+    """
+    key = name.strip()
+    if key.lower() == "local":
+        return "local", None
+    if key.lower() == "utc":
+        key = "UTC"
+    if not key:
+        raise ValueError("empty zone name")
+    return key, ZoneInfo(key)
+
+
+def now_in(tz: ZoneInfo | None) -> datetime:
+    """Aware current time in ``tz``, or in the system zone when None."""
+    return datetime.now(tz) if tz is not None else datetime.now().astimezone()
+
+
 def fmt_finish(dt: datetime, tz: ZoneInfo | None = None) -> str:
     """Local (or given-zone) completion time: 'today 14:32 CDT', 'tomorrow ...', 'Thu 18 Sep ...'."""
     if tz is not None:
@@ -749,6 +772,80 @@ class ConfirmDialog(Dialog):
         if ch == "y":
             self.on_yes()
         return True
+
+class TimezoneDialog(Dialog):
+    """Pick the zone used by the header clock and the finish times (key z)."""
+    title = "timezone"
+    CHOICES = (("America/Chicago", "US Central"), ("America/New_York", "US Eastern"),
+               ("America/Denver", "US Mountain"), ("America/Los_Angeles", "US Pacific"),
+               ("America/Anchorage", "US Alaska"), ("Pacific/Honolulu", "US Hawaii"),
+               ("UTC", ""), ("local", "system"))
+
+    def __init__(self, runner: Runner):
+        self.runner = runner
+        self.typing = False      # True while the "type a zone name" line is active
+        self.buffer = ""
+        self.error = ""
+
+    def current(self) -> str:
+        return self.runner.tz.key if self.runner.tz is not None else "local"
+
+    def apply(self, name: str) -> bool:
+        try:
+            resolved, tz = resolve_tz(name)
+        except (KeyError, ValueError):
+            self.error = f"unknown zone {name.strip()!r} (IANA name, 'utc' or 'local')"
+            return False
+        self.runner.tz = tz
+        self.error = ""
+        LOG.info("timezone set to %s", resolved, extra={"event": "timezone"})
+        return True
+
+    def render(self, width: int, height: int) -> Panel:
+        cur = self.current()
+        rows = Table.grid(padding=(0, 2))
+        rows.add_column(no_wrap=True)
+        rows.add_column(no_wrap=True)
+        rows.add_column(no_wrap=True)
+        for n, (name, desc) in enumerate(self.CHOICES, 1):
+            try:
+                clock = now_in(resolve_tz(name)[1]).strftime("%H:%M %Z").strip()
+            except (KeyError, ValueError):
+                clock = "unavailable"
+            style = "bold green" if name == cur else ""
+            rows.add_row(Text(str(n), style="bold"), Text(f"{name} ({desc})" if desc else name, style=style),
+                         Text(clock, style=style or "dim"))
+        rows.add_row(Text("9", style="bold"), Text("type a zone name", style="bold green" if self.typing else ""),
+                     Text(""))
+        lines: list[Any] = [rows]
+        if self.typing:
+            lines.append(Text.assemble(("zone: ", "dim"), self.buffer, ("_", "blink")))
+            hint = "Enter applies, Backspace deletes, Esc cancels"
+        else:
+            hint = "press a number; Esc or q closes"
+        lines.append(Text(self.error, style="bold red") if self.error else Text(hint, style="dim"))
+        return Panel(Group(*lines), title=f"{self.title}: {cur}", title_align="left", border_style="yellow",
+                     padding=(0, 1))
+
+    def handle(self, ch: str) -> bool:
+        if self.typing:
+            if ch == "\x1b":
+                self.typing, self.buffer, self.error = False, "", ""
+            elif ch in ("\r", "\n"):
+                return self.apply(self.buffer)
+            elif ch in ("\x7f", "\x08"):
+                self.buffer = self.buffer[:-1]
+            elif ch.isprintable():
+                self.buffer += ch
+            return False
+        if ch in ("\x1b", "q"):
+            return True
+        if ch == "9":
+            self.typing, self.buffer, self.error = True, "", ""
+            return False
+        if ch.isdigit() and 1 <= int(ch) <= len(self.CHOICES):
+            return self.apply(self.CHOICES[int(ch) - 1][0])
+        return False
 
 
 class Runner:
@@ -861,6 +958,10 @@ class Runner:
         self.add_key("d", label("d", "delete", bool(self.args.delete_source)), toggle_delete)
         self.add_key("t", label("t", "tune", bool(self.args.tune_dest)), toggle_tune)
         self.add_key("c", label("c", "create", not self.args.no_create), toggle_create)
+        def zone() -> None:
+            self.dialog = TimezoneDialog(self)
+
+        self.add_key("z", "z timezone", zone)
 
     def key_help(self) -> Text:
         """Footer text built from the bindings: labels are 'KEY description'."""
@@ -1412,7 +1513,8 @@ class Runner:
         hdr.add_column(justify="right", no_wrap=True)
         left = Text.assemble((str(self.cluster_name), "bold"), f" @ {a.host}:{a.port}  ·  ",
                              (Path(str(a.list)).name, "bold"), f"  ·  {len(self.jobs)} jobs  ·  ", self._mode_text())
-        right = Text.assemble(datetime.now().strftime("%H:%M:%S"), ("   up ", "dim"), fmt_secs(st["elapsed"]))
+        right = Text.assemble(now_in(self.tz).strftime("%H:%M:%S %Z").strip(), ("   up ", "dim"),
+                              fmt_secs(st["elapsed"]))
         hdr.add_row(left, right)
         header = Panel(hdr, border_style="cyan", padding=(0, 1))
 
@@ -2042,6 +2144,9 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     s.add_argument("--json-log", type=Path, default=Path("reindex.jsonl"), help="JSON-lines log ('' to disable)")
     s.add_argument("--no-tui", action="store_true", help="plain log lines instead of the live dashboard")
     s.add_argument("--debug", action="store_true", help="log every poll and HTTP request to the log files")
+    s.add_argument("--timezone", default=env_default("REINDEX_TZ", DEFAULT_TZ), metavar="ZONE",
+                   help="zone for the dashboard clock and finish times: an IANA name, 'utc' or 'local' "
+                        "[env REINDEX_TZ]")
     a = p.parse_args(argv)
     try:
         a.port = int(a.port)
@@ -2066,6 +2171,15 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
                 raise ValueError
         except ValueError:
             p.error("--dest-shards must be a positive integer or 'auto'")
+    try:
+        a.timezone, a.tzinfo = resolve_tz(str(a.timezone))
+    except (KeyError, ValueError):
+        if str(a.timezone).strip() != DEFAULT_TZ:
+            p.error(f"--timezone / REINDEX_TZ: unknown zone {a.timezone!r} (use an IANA name such as "
+                    f"Europe/Berlin, 'utc' or 'local'; install the tzdata package if the system has no zone database)")
+        print(f"warning: zone {DEFAULT_TZ} is not available on this system; using the local zone "
+              f"(install the tzdata package or pass --timezone)", file=sys.stderr)
+        a.timezone, a.tzinfo = "local", None
     a.cluster_health = {}
     if str(a.log_file) in ("", "."):
         a.log_file = None
