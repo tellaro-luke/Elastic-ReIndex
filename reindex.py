@@ -37,8 +37,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlencode
+from zoneinfo import ZoneInfo
 
 from opensearchpy import OpenSearch
 from opensearchpy import exceptions as os_exc
@@ -708,13 +709,31 @@ def sparkline(values: list[float], rows: int = 2) -> list[Text]:
     return lines
 
 
-def fmt_finish(dt: datetime) -> str:
-    now = datetime.now().astimezone()
+def fmt_finish(dt: datetime, tz: ZoneInfo | None = None) -> str:
+    """Local (or given-zone) completion time: 'today 14:32 CDT', 'tomorrow ...', 'Thu 18 Sep ...'."""
+    if tz is not None:
+        dt = dt.astimezone(tz)
+    now = datetime.now(dt.tzinfo)
     if dt.date() == now.date():
         return dt.strftime("today %H:%M %Z").strip()
     if (dt.date() - now.date()).days == 1:
         return dt.strftime("tomorrow %H:%M %Z").strip()
     return dt.strftime("%a %d %b %H:%M %Z").strip()
+
+
+class Dialog:
+    """A modal box shown in place of the jobs table while it is open.
+
+    Subclasses render themselves with ``render()`` and consume keys with
+    ``handle(ch)``; returning True closes the dialog.
+    """
+    title = "dialog"
+
+    def render(self, width: int, height: int) -> Panel:
+        return Panel(Text("press Esc to close", style="dim"), title=self.title, border_style="yellow")
+
+    def handle(self, ch: str) -> bool:
+        return ch in ("\x1b", "q")
 
 
 class Runner:
@@ -748,9 +767,60 @@ class Runner:
         self.poll_stop = threading.Event()
         self.cluster_stats: dict[str, Any] = dict(cluster_stats or {})
         self.rejected_base: int | None = None
-        # keyboard
+        # keyboard: key -> (help label, action). Extend via add_key(); the footer is built from it.
         self.keys: queue.Queue[str] = queue.Queue()
         self.keys_stop = threading.Event()
+        self.key_bindings: dict[str, tuple[str, Callable[[], None]]] = {}
+        self.dialog: Dialog | None = None
+        self.graph_window = 900.0            # seconds shown by the throughput graph
+        self.tz: ZoneInfo | None = getattr(args, "tzinfo", None)
+        self._default_keys()
+
+    # ---- key bindings (shared hook: every feature registers here)
+    def add_key(self, ch: str, label: str, action: Callable[[], None], aliases: tuple[str, ...] = ()) -> None:
+        self.key_bindings[ch] = (label, action)
+        for a in aliases:
+            self.key_bindings[a] = ("", action)
+
+    def _default_keys(self) -> None:
+        def soft() -> None:
+            if not self.soft_stop.is_set():
+                self.soft_stop.set()
+                LOG.warning("q pressed: no new jobs will start; running jobs continue", extra={"event": "soft_stop"})
+
+        def hard() -> None:
+            if not self.hard_stop.is_set():
+                self.soft_stop.set()
+                self.hard_stop.set()
+                LOG.warning("Q pressed: cancelling running tasks", extra={"event": "hard_stop"})
+
+        def fewer() -> None:
+            if self.max_active > 1:
+                self.max_active -= 1
+                LOG.info("concurrency lowered to %d job(s)", self.max_active, extra={"event": "slots"})
+
+        def more() -> None:
+            if self.max_active < self.POOL_CAP:
+                self.max_active += 1
+                LOG.info("concurrency raised to %d job(s)", self.max_active, extra={"event": "slots"})
+
+        def pause() -> None:
+            self.paused = not self.paused
+            LOG.warning("launching %s", "paused" if self.paused else "resumed", extra={"event": "pause"})
+
+        self.add_key("q", "stop", soft)
+        self.add_key("Q", "cancel", hard)
+        self.add_key("-", "-/+ slots", fewer, aliases=("_",))
+        self.add_key("+", "", more, aliases=("=",))
+        self.add_key("p", "pause", pause)
+
+    def key_help(self) -> Text:
+        t = Text()
+        for ch, (label, _) in self.key_bindings.items():
+            if label:
+                t.append(ch if not label.startswith(ch) else "", style="bold")
+                t.append(f"{'' if label.startswith(ch) else ' '}{label}  ")
+        return t
 
     # ---- per-job pipeline
     def run_job(self, job: Job) -> str:
@@ -1083,22 +1153,17 @@ class Runner:
                 ch = self.keys.get_nowait()
             except queue.Empty:
                 return
-            if ch == "q" and not self.soft_stop.is_set():
-                self.soft_stop.set()
-                LOG.warning("q pressed: no new jobs will start; running jobs continue", extra={"event": "soft_stop"})
-            elif ch == "Q" and not self.hard_stop.is_set():
-                self.soft_stop.set()
-                self.hard_stop.set()
-                LOG.warning("Q pressed: cancelling running tasks", extra={"event": "hard_stop"})
-            elif ch in ("-", "_") and self.max_active > 1:
-                self.max_active -= 1
-                LOG.info("concurrency lowered to %d job(s)", self.max_active, extra={"event": "slots"})
-            elif ch in ("+", "=") and self.max_active < self.POOL_CAP:
-                self.max_active += 1
-                LOG.info("concurrency raised to %d job(s)", self.max_active, extra={"event": "slots"})
-            elif ch == "p":
-                self.paused = not self.paused
-                LOG.warning("launching %s", "paused" if self.paused else "resumed", extra={"event": "pause"})
+            if self.dialog is not None:
+                try:
+                    if self.dialog.handle(ch):
+                        self.dialog = None
+                except Exception:  # noqa: BLE001 - a dialog bug must not take the run down
+                    LOG.exception("dialog failed", extra={"event": "dialog_failed"})
+                    self.dialog = None
+                continue
+            binding = self.key_bindings.get(ch)
+            if binding:
+                binding[1]()
 
     # ---- bookkeeping
     def _record(self, key: str, flush: bool = False, **fields: Any) -> None:
@@ -1184,8 +1249,9 @@ class Runner:
         dt = now - old[0]
         return (self.samples[-1][1] - old[1]) / dt if dt > 0 else 0.0
 
-    def history(self, cols: int, bucket: float = 10.0) -> list[float]:
-        """docs/s per bucket for the last ``cols`` buckets, oldest first."""
+    def history(self, cols: int, window: float | None = None) -> list[float]:
+        """docs/s per bucket for the last ``window`` seconds in ``cols`` buckets, oldest first."""
+        bucket = max(1.0, (window or self.graph_window) / cols)
         if len(self.samples) < 2:
             return [0.0] * cols
         now = self.samples[-1][0]
@@ -1239,7 +1305,7 @@ class Runner:
             eta_s = remaining / self.rate_smooth
         else:
             eta_s = None
-        finish = datetime.now().astimezone() + timedelta(seconds=eta_s) if eta_s is not None else None
+        finish = (datetime.now(timezone.utc) + timedelta(seconds=eta_s)).astimezone(self.tz) if eta_s is not None else None
         return {"planned": planned, "done": done, "pct": (done / planned * 100) if planned else 0.0,
                 "recent": recent, "avg": avg, "eta_s": eta_s, "finish": finish, "warm": warm,
                 "elapsed": now - self.t0}
@@ -1267,7 +1333,7 @@ class Runner:
         finished = sum(t.values())
         width, height = self.console.size.width, self.console.size.height
         eta = fmt_eta(st["eta_s"]) if st["eta_s"] is not None else ("warming up" if st["done"] == 0 else "--")
-        finish = fmt_finish(st["finish"]) if st["finish"] else "--"
+        finish = fmt_finish(st["finish"], self.tz) if st["finish"] else "--"
 
         # header
         hdr = Table.grid(expand=True)
@@ -1295,7 +1361,7 @@ class Runner:
         hist = self.history(graph_cols)
         rows = 1 if compact else 2
         graph = sparkline(hist, rows=rows)
-        label = Text.assemble(("docs/s · last ", "dim"), f"{graph_cols * 10 // 60} min",
+        label = Text.assemble(("docs/s · last ", "dim"), fmt_secs(self.graph_window).rstrip("0s") or "0s",
                               ("   peak ", "dim"), f"{max(hist):,.0f}/s")
         counters = Text.assemble(
             ("indices ", "dim"), f"{finished}/{len(self.jobs)}  ", ("done ", "green"), f"{t['done']} ",
@@ -1401,8 +1467,8 @@ class Runner:
         elif self.soft_stop.is_set():
             foot = "Stopping: running jobs finish, nothing new starts.  Q or Ctrl+C again cancels them."
         else:
-            foot = "q stop · Q cancel · -/+ concurrency · p pause · Ctrl+C once/twice = q/Q"
-        footer = Text(foot, style="dim")
+            foot = None
+        footer = Text(foot, style="dim") if foot else Text.assemble(self.key_help(), ("· Ctrl+C once/twice = q/Q", "dim"))
 
         if height < 24:
             return Group(header, jobs_panel, footer)
@@ -1416,7 +1482,7 @@ class Runner:
         layout["header"].update(header)
         layout["progress"].update(progress)
         layout["cluster"].update(cluster_panel)
-        layout["jobs"].update(jobs_panel)
+        layout["jobs"].update(self.dialog.render(width, jobs_rows + 4) if self.dialog else jobs_panel)
         if show_problems:
             layout["problems"].update(problems_panel)
         layout["events"].update(events_panel)
@@ -1489,7 +1555,7 @@ class Runner:
                                      sum(1 for f in futures if not f.done()), f"{st['done']:,}", f"{st['planned']:,}",
                                      st["pct"], st["recent"], st["avg"],
                                      fmt_eta(st["eta_s"]) if st["eta_s"] is not None else "--",
-                                     fmt_finish(st["finish"]) if st["finish"] else "--",
+                                     fmt_finish(st["finish"], self.tz) if st["finish"] else "--",
                                      extra={"event": "progress", "counts": {"total": st["planned"]},
                                             "elapsed_s": round(st["elapsed"], 1),
                                             "eta_s": round(st["eta_s"], 1) if st["eta_s"] is not None else None,
@@ -2085,6 +2151,7 @@ def main(argv: list[str] | None = None) -> int:
 
     console.print(summary_table(jobs, state, runner))
     t = runner.tally()
+    # post-run hooks (e.g. refreshing Dashboards index patterns) go here
     LOG.info("run finished: %d done, %d failed, %d lost, exit=%d", t["done"], t["failed"], t["lost"], code,
              extra={"event": "run_end", "elapsed_s": round(time.monotonic() - runner.t0, 1)})
     if t["failed"]:
