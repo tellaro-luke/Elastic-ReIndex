@@ -791,18 +791,35 @@ class JobView:
     source_count: int = 0
 
 
-def sparkline(values: list[float], rows: int = 2) -> list[Text]:
-    """btop-style block graph: ``rows`` lines of block characters, oldest value first."""
+def nice_ceil(x: float) -> float:
+    """Smallest 1, 2 or 5 x 10^n that is >= ``x`` (never below 1): a scale that only moves in steps."""
+    if x <= 1:
+        return 1.0
+    e = 10 ** math.floor(math.log10(x))
+    return float(next(m * e for m in (1, 2, 5, 10) if m * e >= x))
+
+
+def sparkline(values: list[float | None], rows: int = 2, scale: float | None = None) -> list[Text]:
+    """btop-style block graph: ``rows`` lines of block characters, oldest value first.
+
+    Heights and colours are fractions of ``scale`` (default: the largest value), so a
+    fixed scale gives fixed bars. ``None`` draws a blank column (no data).
+    """
     blocks = " ▁▂▃▄▅▆▇█"
-    peak = max(values) if values and max(values) > 0 else 1.0
+    known = [v for v in values if v is not None]
+    if scale is None or scale <= 0:
+        scale = max(known) if known and max(known) > 0 else 1.0
     lines: list[Text] = []
     for r in range(rows):
         t = Text()
         for v in values:
-            level = v / peak * 8 * rows
-            row_level = level - 8 * (rows - 1 - r)
+            if v is None:
+                t.append(" ")
+                continue
+            frac = min(1.0, max(0.0, v / scale))
+            row_level = frac * 8 * rows - 8 * (rows - 1 - r)
             idx = int(min(8, max(0, round(row_level))))
-            style = "bright_cyan" if v >= 0.66 * peak else ("cyan" if v >= 0.33 * peak else "blue")
+            style = "bright_cyan" if frac >= 0.66 else ("cyan" if frac >= 0.33 else "blue")
             t.append(blocks[idx], style=style)
         lines.append(t)
     return lines
@@ -986,6 +1003,7 @@ class Runner:
         self.graph_window = 900.0            # seconds shown by the throughput graph
         self.tz: ZoneInfo | None = getattr(args, "tzinfo", None)
         self._default_keys()
+        self._init_graph()
 
     # ---- key bindings (shared hook: every feature registers here)
     def add_key(self, ch: str, label: str, action: Callable[[], None], aliases: tuple[str, ...] = ()) -> None:
@@ -1519,29 +1537,109 @@ class Runner:
         dt = now - old[0]
         return (self.samples[-1][1] - old[1]) / dt if dt > 0 else 0.0
 
-    def history(self, cols: int, window: float | None = None) -> list[float]:
-        """docs/s per bucket for the last ``window`` seconds in ``cols`` buckets, oldest first."""
-        bucket = max(1.0, (window or self.graph_window) / cols)
-        if len(self.samples) < 2:
-            return [0.0] * cols
-        now = self.samples[-1][0]
-        pts = list(self.samples)
+    # ---- throughput graph: cumulative docs at fixed wall-clock bucket boundaries
+    GRAPH_BUCKET = 10.0
+    GRAPH_WINDOWS = ((900, "15m"), (1800, "30m"), (3600, "60m"), (7200, "2h"),
+                     (21600, "6h"), (86400, "24h"), (259200, "72h"))
 
-        def docs_at(t: float) -> int | None:
-            best = None
-            for s in pts:
-                if s[0] <= t:
-                    best = s
-                else:
-                    break
-            return best[1] if best else None
+    def _init_graph(self) -> None:
+        # _graph_ring[i] is docs_done at boundary (k0 + i) * GRAPH_BUCKET, k0 = _graph_k - len(ring);
+        # (_graph_t0, _graph_d0) is the first sample (nothing is known before it), _graph_last the latest.
+        self._graph_ring: list[float] = []
+        self._graph_k = 0
+        self._graph_t0: float | None = None
+        self._graph_d0 = 0.0
+        self._graph_last = (0.0, 0.0)
+        self._graph_cap = int(self.GRAPH_WINDOWS[-1][0] / self.GRAPH_BUCKET) + 1
 
-        out: list[float] = []
-        for i in range(cols - 1, -1, -1):
-            end = now - i * bucket
-            a, b = docs_at(end - bucket), docs_at(end)
-            out.append(max(0.0, (b - a) / bucket) if a is not None and b is not None else 0.0)
-        return out
+        def cycle(step: int) -> None:
+            secs = [w for w, _ in self.GRAPH_WINDOWS]
+            i = secs.index(int(self.graph_window)) if int(self.graph_window) in secs else -step
+            self.graph_window = float(secs[(i + step) % len(secs)])
+            self.key_bindings["g"] = (f"g graph {self.graph_window_name()}", forward)
+
+        def forward() -> None:
+            cycle(1)
+
+        def back() -> None:
+            cycle(-1)
+
+        self.add_key("g", f"g graph {self.graph_window_name()}", forward)
+        self.add_key("G", "", back)
+
+    def graph_window_name(self) -> str:
+        return dict(self.GRAPH_WINDOWS).get(int(self.graph_window)) or fmt_secs(self.graph_window).rstrip("0s") or "0s"
+
+    def _graph_feed(self, t: float, docs: float) -> None:
+        """Record cumulative ``docs`` at wall-clock ``t``; completes every bucket boundary passed since the last call."""
+        b = self.GRAPH_BUCKET
+        if self._graph_t0 is None:
+            self._graph_t0, self._graph_d0 = t, docs
+            self._graph_k = int(t // b) + 1
+            self._graph_last = (t, docs)
+            return
+        lt, ld = self._graph_last
+        if t <= lt:
+            return
+        while self._graph_k * b <= t:
+            self._graph_ring.append(ld + (docs - ld) * (self._graph_k * b - lt) / (t - lt))
+            self._graph_k += 1
+        self._graph_last = (t, docs)
+        if len(self._graph_ring) > self._graph_cap + 360:
+            del self._graph_ring[:len(self._graph_ring) - self._graph_cap]
+            self._graph_t0 = (self._graph_k - len(self._graph_ring)) * b
+            self._graph_d0 = self._graph_ring[0]
+
+    def _graph_docs_at(self, t: float) -> float | None:
+        """Cumulative docs at wall-clock ``t``, linear between known points; None before the first sample."""
+        if self._graph_t0 is None or t < self._graph_t0:
+            return None
+        lt, ld = self._graph_last
+        if t >= lt:
+            return ld
+        b, ring = self.GRAPH_BUCKET, self._graph_ring
+        k0 = self._graph_k - len(ring)
+        if not ring or t >= (self._graph_k - 1) * b:
+            ta, da = ((self._graph_k - 1) * b, ring[-1]) if ring else (self._graph_t0, self._graph_d0)
+            tb, db = lt, ld
+        else:
+            j = int(t // b)
+            ta, da = (j * b, ring[j - k0]) if j >= k0 else (self._graph_t0, self._graph_d0)
+            tb, db = (j + 1) * b, ring[j + 1 - k0]
+        return da if tb <= ta else da + (db - da) * (t - ta) / (tb - ta)
+
+    def graph_now(self) -> float:
+        """docs/s over the latest completed bucket."""
+        ring = self._graph_ring
+        prev = ring[-2] if len(ring) >= 2 else (self._graph_d0 if ring else None)
+        return max(0.0, (ring[-1] - prev) / self.GRAPH_BUCKET) if prev is not None else 0.0
+
+    def history(self, cols: int, window: float | None = None) -> tuple[list[float | None], int]:
+        """docs/s per column for the last ``window`` seconds, oldest first, and how many leading
+        columns are settled.
+
+        Columns are fixed wall-clock intervals (multiples of the column width), so a column
+        only changes once its last bucket completes; until then it is fed by the live sample.
+        ``None`` marks columns from before the first sample.
+        """
+        cols = max(1, cols)
+        cw = (window or self.graph_window) / cols
+        if self._graph_t0 is None:
+            return [None] * cols, 0
+        now, _ = self._graph_last
+        final = (self._graph_k - 1) * self.GRAPH_BUCKET if self._graph_ring else self._graph_t0
+        m = math.floor(now / cw) + 1    # boundary index of the current column's end
+        out: list[float | None] = []
+        settled = 0
+        for i in range(cols):
+            b = (m - (cols - 1 - i)) * cw
+            a = max(b - cw, self._graph_t0)
+            b2 = min(b, now)
+            da, db = self._graph_docs_at(a), self._graph_docs_at(b2)
+            out.append(max(0.0, (db - da) / (b2 - a)) if da is not None and db is not None and b2 > a else None)
+            if b <= final:
+                settled = i + 1
+        return out, settled
 
     def stats(self) -> dict[str, Any]:
         """One consistent set of progress numbers for the dashboard and the plain progress line."""
@@ -1552,6 +1650,7 @@ class Runner:
             done = min(done, planned)
         if not self.samples or now - self.samples[-1][0] >= 0.5:
             self.samples.append((now, done))
+        self._graph_feed(time.time(), done)
         recent = self._window_rate(now, 60.0)
         with self.lock:
             starts = [v.started_at for v in self.views.values() if v.started_at]
@@ -1630,11 +1729,16 @@ class Runner:
                               ("ETA ", "dim"), (eta, "bold"), ("   finishes ", "dim"), (finish, "bold"),
                               no_wrap=True, overflow="ellipsis")
         graph_cols = max(20, int(width * 0.6) - 16)
-        hist = self.history(graph_cols)
+        hist, settled = self.history(graph_cols)
         rows = 1 if compact else 2
-        graph = sparkline(hist, rows=rows)
-        label = Text.assemble(("docs/s · last ", "dim"), fmt_secs(self.graph_window).rstrip("0s") or "0s",
-                              ("   peak ", "dim"), f"{max(hist):,.0f}/s")
+        # scale and peak come from settled columns only, so they cannot wobble with the live one
+        seen = [v for v in hist[:settled] if v is not None] or [v for v in hist if v is not None]
+        peak = max(seen) if seen else 0.0
+        scale = nice_ceil(peak)
+        graph = sparkline(hist, rows=rows, scale=scale)
+        label = Text.assemble(("docs/s · last ", "dim"), self.graph_window_name(),
+                              ("   scale ", "dim"), f"{scale:,.0f}/s", ("   peak ", "dim"), f"{peak:,.0f}/s",
+                              ("   now ", "dim"), f"{self.graph_now():,.0f}/s", no_wrap=True, overflow="ellipsis")
         counters = Text.assemble(
             ("indices ", "dim"), f"{finished}/{len(self.jobs)}  ", ("done ", "green"), f"{t['done']} ",
             ("fail ", "red"), f"{t['failed'] + t['lost']} ", ("held ", "yellow"), f"{t['held'] + t['cancelled']} ",
