@@ -640,7 +640,7 @@ class JsonFormatter(logging.Formatter):
 class RingHandler(logging.Handler):
     """Keeps the last few records (and the last few problems) for the dashboard."""
 
-    def __init__(self, size: int = 6, problems: int = 6):
+    def __init__(self, size: int = 40, problems: int = 12):
         super().__init__(logging.INFO)
         self.buf: deque[tuple[float, int, str, str]] = deque(maxlen=size)
         self.problems: deque[tuple[float, int, str, str]] = deque(maxlen=problems)
@@ -1469,11 +1469,15 @@ class Runner:
                                           " slots ", ("p", "bold"), " pause"))
         cluster_panel = Panel(cl, title="Cluster", title_align="left", border_style="green", padding=(0, 1))
 
-        # jobs box
+        # jobs box: as tall as the active jobs need (at least 3 rows, plus 4 for border and
+        # header), the problems box only when there are problems, everything left to events.
         top_size = 7 if compact else 9
-        events_size = 5 if compact else 7
-        show_problems = height >= 34
-        jobs_rows = max(1, height - 3 - top_size - events_size - 1 - (6 if show_problems else 0) - 4)
+        avail = height - 3 - top_size - 1
+        problems_rows = min(len(ring.problems), 6, avail - 16) if height >= 34 else 0
+        show_problems = problems_rows > 0
+        problems_size = problems_rows + 2 if show_problems else 0
+        jobs_rows = max(1, min(max(3, len(active)), avail - problems_size - 11))
+        events_size = max(3, avail - problems_size - jobs_rows - 4)
         jobs = Table(box=box.SIMPLE_HEAD, expand=True, show_edge=False, pad_edge=False)
         jobs.add_column("Source → Destination", ratio=3, min_width=24, no_wrap=True, overflow="ellipsis")
         if width >= 120:
@@ -1528,7 +1532,7 @@ class Runner:
                 ev.add_row("", "", "", Text(empty, style="dim"))
             return ev
 
-        problems_panel = Panel(events_table(list(ring.problems)[-4:], "none so far"),
+        problems_panel = Panel(events_table(list(ring.problems)[-problems_rows:], "none so far"),
                                title=f"Problems ({len(ring.problems)} recent)", title_align="left",
                                border_style="red" if ring.problems else "dim", padding=(0, 1))
         events_panel = Panel(events_table(list(ring.buf)[-(events_size - 2):], "no events yet"),
@@ -1544,10 +1548,11 @@ class Runner:
         if height < 24:
             return Group(header, jobs_panel, footer)
         layout = Layout()
-        sections = [Layout(name="header", size=3), Layout(name="top", size=top_size), Layout(name="jobs", ratio=1)]
+        sections = [Layout(name="header", size=3), Layout(name="top", size=top_size),
+                    Layout(name="jobs", size=jobs_rows + 4)]
         if show_problems:
-            sections.append(Layout(name="problems", size=6))
-        sections += [Layout(name="events", size=events_size), Layout(name="footer", size=1)]
+            sections.append(Layout(name="problems", size=problems_size))
+        sections += [Layout(name="events", ratio=1), Layout(name="footer", size=1)]
         layout.split_column(*sections)
         layout["top"].split_row(Layout(name="progress", ratio=3), Layout(name="cluster", ratio=2, minimum_size=36))
         layout["header"].update(header)
