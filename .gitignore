@@ -1,0 +1,12 @@
+reindex-state.json
+*.lock
+!poetry.lock
+.reindex-state-*.tmp
+*.log
+*.log.*
+*.jsonl
+*.jsonl.*
+__pycache__/
+.venv/
+dist/
+*.egg-info/
