@@ -1195,10 +1195,15 @@ class Runner:
                              idx, orig.get("number_of_replicas"), orig.get("refresh_interval") or "default",
                              extra={"event": "tune"})
                 source_count = self.cluster.count(job.source)
+                try:
+                    dest_count_start: int | None = self.cluster.count(job.dest)
+                except (JobError, os_exc.OpenSearchException):
+                    dest_count_start = None
                 with self.lock:
                     self.views[key].source_count = source_count
                 self._record(key, status="running", started=utcnow(), finished=None, error=None,
-                             note=None, task=None, source_count=source_count, deleted_source=False)
+                             note=None, task=None, source_count=source_count, deleted_source=False,
+                             dest_count_start=dest_count_start)
                 task_id = self.cluster.start_reindex(
                     job, slices=a.slices, rps=a.requests_per_second, conflicts=a.conflicts,
                     require_alias=a.require_alias, dest_kind=dest_kind, batch_size=a.batch_size)
@@ -1286,6 +1291,7 @@ class Runner:
         with self.poll_cv:
             seen_gen = self.poll_gen
         grace_until: float | None = None
+        missing = 0
         try:
             while True:
                 if self.hard_stop.is_set():
@@ -1326,8 +1332,11 @@ class Runner:
                 try:
                     task = self.cluster.get_task(task_id)
                 except os_exc.NotFoundError:
-                    raise JobError(f"task {task_id} is gone from the cluster (node restart, or the .tasks "
-                                   "index could not be written)")
+                    missing += 1
+                    if missing < 3:
+                        log.debug("task %s not found yet (%d); retrying", task_id, missing)
+                        continue      # the stored result can lag the task list by a poll or two
+                    return self._recover_without_result(job, task_id, log)
                 if not task.get("completed"):
                     continue
                 with self.lock:
@@ -1346,6 +1355,41 @@ class Runner:
         finally:
             with self.lock:
                 self.task_jobs.pop(task_id, None)
+
+    def _recover_without_result(self, job: Job, task_id: str, log: JobLog) -> dict[str, Any]:
+        """The task finished but its stored result is gone (.tasks unwritable, cleaned up, node lost).
+
+        Decide from evidence instead: the destination must have gained at least the source's
+        document count since the job started. Returns a synthetic completed task for _verify.
+        """
+        st = self.state.job(job.key)
+        source_count = int(st.get("source_count") or 0)
+        start = st.get("dest_count_start")
+        with self.lock:
+            last = dict(self.views[job.key].counts or {})
+        try:
+            dest_now = self.cluster.count(job.dest)
+        except (JobError, os_exc.OpenSearchException) as e:
+            raise JobError(f"task {task_id} is gone from the cluster and the destination could not be counted: "
+                           f"{describe(e)}")
+        if start is None:
+            raise JobError(f"task {task_id} is gone from the cluster (node restart, or the .tasks index could not "
+                           f"be written); last poll showed {processed(last):,} of {last.get('total', 0):,} docs and "
+                           "no starting destination count was recorded, so the outcome cannot be verified; "
+                           "re-run with --retry-failed to redo the reindex")
+        gained = dest_now - int(start)
+        if gained < source_count:
+            raise JobError(f"task {task_id} is gone from the cluster; destination gained {gained:,} of "
+                           f"{source_count:,} docs (last poll {processed(last):,}); re-run with --retry-failed")
+        log.warning("task %s finished but its stored result is missing (.tasks); verified by count instead: "
+                    "destination gained %s docs for a source of %s", task_id, f"{gained:,}", f"{source_count:,}",
+                    extra={"event": "task_result_missing", "task": task_id})
+        self._record(job.key, note=f"task result missing; verified by document count (+{gained:,})")
+        counts = dict.fromkeys(COUNT_FIELDS, 0)
+        counts["total"] = source_count
+        counts["created"] = source_count
+        return {"completed": True, "synthetic": True, "task": {"status": counts},
+                "response": {"failures": [], **counts}}
 
     def _verify(self, job: Job, task: dict[str, Any], log: JobLog) -> list[str]:
         c = task_counts(task)

@@ -263,6 +263,11 @@ On the next run:
   Other failed jobs are skipped unless you pass `--retry-failed`.
 * A job cancelled by the second Ctrl+C goes back to `pending` and restarts from scratch. A
   task cancelled on the cluster by someone else fails verification and becomes `failed`.
+* If a task finishes but its stored result is missing (the hidden `.tasks` index was cleaned
+  up, blocked by a disk watermark, or lost with a node), the tool verifies by evidence instead:
+  the destination must have gained at least the source's document count since the job
+  started (recorded at start). The job is then `done` with a note; otherwise it fails with
+  the counts it saw.
 * A job that lost contact with its task (cluster unreachable for longer than `--poll-grace`)
   is reported as `lost`, keeps `running` status and its task id, and re-attaches next run.
 
