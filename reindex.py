@@ -2433,7 +2433,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     if a.dashboards_password_env is None:
         a.dashboards_password_env = a.password_env
     # Defaults follow the list file so two lists (or two clusters) never share a state file.
-    base = "reindex" if a.list.stem == "list" else a.list.stem
+    name = a.list.name[:-4] if a.list.name.endswith(".txt") else a.list.name
+    base = "reindex" if name == "list" else name
     if a.state_file is None:
         a.state_file = Path(f"{base}-state.json")
     if a.log_file is None:
