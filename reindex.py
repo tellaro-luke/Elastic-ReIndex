@@ -808,18 +808,20 @@ class Runner:
             self.paused = not self.paused
             LOG.warning("launching %s", "paused" if self.paused else "resumed", extra={"event": "pause"})
 
-        self.add_key("q", "stop", soft)
-        self.add_key("Q", "cancel", hard)
+        self.add_key("q", "q stop", soft)
+        self.add_key("Q", "Q cancel", hard)
         self.add_key("-", "-/+ slots", fewer, aliases=("_",))
         self.add_key("+", "", more, aliases=("=",))
-        self.add_key("p", "pause", pause)
+        self.add_key("p", "p pause", pause)
 
     def key_help(self) -> Text:
+        """Footer text built from the bindings: labels are 'KEY description'."""
         t = Text()
-        for ch, (label, _) in self.key_bindings.items():
+        for label, _ in self.key_bindings.values():
             if label:
-                t.append(ch if not label.startswith(ch) else "", style="bold")
-                t.append(f"{'' if label.startswith(ch) else ' '}{label}  ")
+                key, _, desc = label.partition(" ")
+                t.append(key, style="bold")
+                t.append(f" {desc}  ")
         return t
 
     # ---- per-job pipeline
