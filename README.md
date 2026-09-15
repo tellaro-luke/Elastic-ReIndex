@@ -16,7 +16,8 @@ trust the results on your own data.
 
 ## Features
 
-* Any number of `source:destination` pairs; destinations can be indices or aliases
+* Any number of `source:destination` pairs; destinations can be indices, aliases, or data streams
+* Missing destinations are created at run time from the matching index template (data stream or index)
 * Read-only dry run that prints the plan and every write request a real run would send
 * Checkpoint file: done jobs are skipped, running tasks are re-attached, failed jobs can be retried
 * Verification before any delete: no failures, not cancelled, all docs accounted for, task total matches the source doc count, and (for index destinations) destination count is at least the source count
@@ -49,12 +50,13 @@ if you keep them elsewhere.
 With the security plugin the user needs, at minimum:
 
 * Cluster: `cluster:monitor/main`, `cluster:monitor/task/get`, `cluster:monitor/tasks/lists`,
-  `cluster:monitor/state` (for `_cat/indices` and `_alias`), and `cluster:admin/tasks/cancel`
-  (only used by the second Ctrl+C).
+  `cluster:monitor/state` (for `_cat/indices` and `_alias`), `indices:admin/index_template/get`,
+  `indices:admin/data_stream/get`, and `cluster:admin/tasks/cancel` (only used by the second Ctrl+C).
 * Sources: `indices:admin/get`, `indices:admin/aliases/get`, `indices:admin/refresh`,
   `indices:data/read/*`, `indices:data/write/reindex`; plus `indices:admin/delete` with `--delete-source`.
 * Destinations: `indices:admin/get`, `indices:admin/aliases/get`, `indices:admin/refresh`,
-  `indices:data/read/search` (the verification count) and `indices:data/write/*`.
+  `indices:data/read/search` (the verification count) and `indices:data/write/*`; plus
+  `indices:admin/create` or `indices:admin/data_stream/create` when the tool creates them.
 
 `admin` has all of these. Preflight checks the task-listing permission up front and refuses to
 start if it is missing, because the poll loop cannot work without it.
@@ -105,6 +107,8 @@ Default is `https://` with certificate verification **off** and the warning sile
 | `--require-alias` | off | Fail in preflight if a destination is not an alias |
 | `--delete-source` | off | Delete a source after its job verifies. Refuses alias sources |
 | `--skip-missing` | off | Skip jobs that fail preflight instead of aborting |
+| `--no-create` | off | Do not create missing destinations |
+| `--create-plain` | off | Allow creating a missing destination that matches no template, as a plain dynamically-mapped index |
 | `--poll-interval`, `--poll-grace` | `5`, `300` | Seconds between task polls; seconds to tolerate an unreachable cluster before giving up on a job (it stays re-attachable) |
 | `--dry-run` | off | Read-only preflight, plan, and the list of writes a real run would send |
 | `-y`, `--yes` | off | No confirmation prompt |
@@ -129,9 +133,17 @@ logstash-example2-source-2022-08-22:logstash-example-destination-2022-08-22
 logstash-example2-source-2022-08-23:logstash-example-destination-2022-08-23
 ```
 
-Destinations must exist before the run. Create them with the mappings and settings you
-want; the tool does not copy settings from the source. An alias destination must resolve
-to a single index or have exactly one write index. For example:
+### Destinations
+
+A destination can be an existing index, an alias (resolving to a single index or having
+exactly one write index), or a data stream. A destination that does not exist is **created
+at run time** from the composable index template that matches its name (highest priority
+wins, matched client-side): a data stream when the template declares `data_stream`, otherwise
+a plain index. The plan shows `create+reindex` with the template name, and the dry run lists
+the exact `PUT /_data_stream/<name>` or `PUT /<name>` request. When no template matches, the
+job fails preflight unless you pass `--create-plain` (a dynamically-mapped index is usually a
+mistake); `--no-create` turns creation off entirely. The tool never copies settings or
+mappings from the source, so put them in the template or create the destination yourself:
 
 ```
 PUT logstash-example-destination-2022-08-22
@@ -147,19 +159,32 @@ POST _aliases
 The tool refreshes a destination before counting it, so `refresh_interval: -1` does not
 break verification.
 
+**Data streams.** Reindexing into a data stream uses `op_type: create` (they are append-only)
+and `conflicts: proceed`, so a re-run of a partly finished job does not abort on documents
+that are already there; those show up as version conflicts, which verification accepts for
+data-stream destinations and logs as "already present". Documents need a `@timestamp`. One
+caveat: if the destination rolled over between the first attempt and the re-run, the re-run
+writes duplicates into the new backing index instead of conflicting, so keep the source until
+the job verifies (the tool does not delete before that anyway).
+
+**Sources.** A data stream's backing index (`.ds-...-000008`) is a normal index source. With
+`--delete-source` the tool refuses the data stream's current write index in preflight, since
+the cluster would reject that delete; roll the stream over first. A data stream name as the
+source reindexes all its backing indices and is refused with `--delete-source`, like an alias.
+
 **Sources must not receive writes during the run.** Verification compares the task's total
 with the source document count taken when the job started; an index that is still being
 written to (today's Logstash index) will fail verification and keep its source.
 
 ### Dry run
 
-`--dry-run` sends only read requests: cluster info, one `_cat/indices` and one `_alias`
-listing, and a task-listing probe for permissions. The cluster wrapper refuses every write in
+`--dry-run` sends only read requests: cluster info, one listing each of `_cat/indices`,
+`_alias`, `_data_stream` and `_index_template`, and a task-listing probe for permissions. The cluster wrapper refuses every write in
 this mode, so it cannot start, cancel, refresh or delete anything even by accident. It prints:
 
 * the plan table (what each job would do: reindex, re-attach, finish, skip, or the preflight error);
-* a table of the write requests a real run would send, per job and in order: the source
-  refresh for the starting count, the full `POST /_reindex` with its query string and body,
+* a table of the write requests a real run would send, per job and in order: the destination
+  create when it is missing, the source refresh for the starting count, the full `POST /_reindex` with its query string and body,
   the destination refresh for verification, and the `DELETE` of the source in red when
   `--delete-source` is set;
 * the conditional cancel request a second Ctrl+C would send, totals, and the read-only
@@ -211,8 +236,9 @@ A job is marked `verified`, and the source becomes eligible for deletion, only w
 2. `created + updated + noops + deleted + version_conflicts == total`
 3. `version_conflicts == 0` unless `--conflicts proceed`
 4. `total` equals the source document count taken when the job started
-5. For a plain index destination, the destination can be counted and now holds at least as
-   many documents as the source (skipped for alias destinations, which collect many sources)
+5. For an index or data stream destination, the destination can be counted and now holds at
+   least as many documents as the source (skipped for alias destinations, which collect many
+   sources). For data streams, rule 3 accepts version conflicts as "already present".
 
 Anything else marks the job `failed`, leaves the source alone, and records the reason
 (failures are summarised by type with the first document and message). If the delete itself
@@ -227,7 +253,8 @@ fails after verification, the job stays `verified` and the next run retries only
   `ts` (UTC), `level`, `logger`, `job` (`null` for run-level lines), `message`, and when
   present `event`, `task`, `counts` (`total`, `created`, `updated`, `deleted`, `noops`,
   `version_conflicts`, `batches`), `elapsed_s`, `reason`, `exception`. Events: `run_start`,
-  `start`, `adopt`, `reattach`, `reattach_failed`, `done`, `verify_failed`, `failed`, `lost`,
+  `start`, `create`, `adopt`, `reattach`, `reattach_failed`, `already_present`, `done`,
+  `verify_failed`, `failed`, `lost`,
   `delete`, `cancelled`, `held`, `poll_retry`, `child_list_failed`, `soft_stop`, `hard_stop`,
   `force_exit`, `state_write_failed`, `crashed`, `run_end`, plus `poll` with `--debug` and
   `progress` in plain mode.
@@ -261,9 +288,9 @@ same), while `GET _tasks/<id>` on the parent will show 0 until the end.
   seconds, so `--requests-per-second 5000` is a mild throttle and `2` would take hours per
   index. The throttle is split across a task's slices, and `--workers N` multiplies the
   cluster-wide rate by N.
-* Preflight makes three cluster calls regardless of list length (`_cat/indices`, `_alias`, a
-  task-listing probe); plan and summary tables show at most 80 rows and hide already-done
-  rows when the list is longer.
+* Preflight makes five cluster calls regardless of list length (`_cat/indices`, `_alias`,
+  `_data_stream`, `_index_template`, a task-listing probe); plan and summary tables show at
+  most 80 rows and hide already-done rows when the list is longer.
 * Set `index.mapping.ignore_malformed: true` on the destination if the source has messy
   field types. See <https://github.com/elastic/elasticsearch/issues/22471>.
 

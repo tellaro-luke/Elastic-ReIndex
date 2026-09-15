@@ -15,6 +15,7 @@ import getpass
 import json
 import logging
 import os
+import re
 import signal
 import sys
 import tempfile
@@ -331,6 +332,8 @@ class Snapshot:
     """One-shot view of the cluster's indices and aliases, taken at preflight."""
     indices: dict[str, dict[str, Any]] = field(default_factory=dict)      # name -> cat row
     aliases: dict[str, dict[str, bool]] = field(default_factory=dict)     # alias -> {index: is_write}
+    data_streams: dict[str, dict[str, Any]] = field(default_factory=dict) # name -> {indices, write_index, template}
+    templates: list[dict[str, Any]] = field(default_factory=list)         # composable templates, priority desc
 
 
 class Cluster:
@@ -374,13 +377,34 @@ class Cluster:
     def snapshot(self) -> Snapshot:
         snap = Snapshot()
         self._read("GET /_cat/indices")
-        for row in self.os.cat.indices(h="index,docs.count,status,health", format="json"):
+        for row in self.os.cat.indices(h="index,docs.count,status,health", format="json",
+                                       expand_wildcards="all"):
             snap.indices[row["index"]] = row
         self._read("GET /_alias")
         for index, body in self.os.indices.get_alias().items():
             for alias, cfg in (body.get("aliases") or {}).items():
                 snap.aliases.setdefault(alias, {})[index] = bool((cfg or {}).get("is_write_index"))
+        self._read("GET /_data_stream")
+        for ds in self.os.indices.get_data_stream().get("data_streams") or []:
+            backing = [i["index_name"] for i in ds.get("indices") or []]
+            snap.data_streams[ds["name"]] = {"indices": backing, "write_index": backing[-1] if backing else None,
+                                             "template": ds.get("template")}
+        self._read("GET /_index_template")
+        for t in self.os.indices.get_index_template().get("index_templates") or []:
+            body = t.get("index_template") or {}
+            snap.templates.append({"name": t.get("name"), "patterns": list(body.get("index_patterns") or []),
+                                   "priority": int(body.get("priority") or 0), "data_stream": "data_stream" in body})
+        snap.templates.sort(key=lambda t: -t["priority"])
         return snap
+
+    @staticmethod
+    def match_template(snap: Snapshot, name: str) -> dict[str, Any] | None:
+        """The composable index template that would apply to ``name`` (highest priority wins)."""
+        for t in snap.templates:
+            for pat in t["patterns"]:
+                if re.fullmatch(re.escape(pat).replace(r"\*", ".*"), name):
+                    return t
+        return None
 
     def index_exists(self, name: str) -> bool:
         self._read("HEAD /{index}")
@@ -428,13 +452,30 @@ class Cluster:
 
     # ---- writes
     def reindex_request(self, job: Job, *, slices: str, rps: float, conflicts: str,
-                        require_alias: bool) -> tuple[str, dict[str, Any]]:
+                        require_alias: bool, dest_kind: str | None = None) -> tuple[str, dict[str, Any]]:
         params: dict[str, Any] = {"wait_for_completion": "false", "slices": slices,
                                   "requests_per_second": rps}
         if require_alias:
             params["require_alias"] = "true"
-        body = {"source": {"index": job.source}, "dest": {"index": job.dest}, "conflicts": conflicts}
+        body: dict[str, Any] = {"source": {"index": job.source}, "dest": {"index": job.dest},
+                                "conflicts": conflicts}
+        if dest_kind == "data_stream":
+            body["dest"]["op_type"] = "create"   # data streams are append-only
+            body["conflicts"] = "proceed"        # a re-run must not abort on docs already there
         return f"POST /_reindex?{urlencode(params)}", body
+
+    def create_destination(self, name: str, kind: str) -> None:
+        """Create a missing destination; the matching index template supplies its settings."""
+        self._write(f"create {kind} {name}")
+        try:
+            if kind == "data_stream":
+                self.os.indices.create_data_stream(name=name)
+            else:
+                self.os.indices.create(index=name)
+        except os_exc.RequestError as e:
+            if "resource_already_exists_exception" in describe(e):
+                return   # another worker (or auto-create) got there first
+            raise
 
     def start_reindex(self, job: Job, **opts: Any) -> str:
         self._write(f"start reindex {job.key}")
@@ -668,6 +709,12 @@ class Runner:
                     log.warning("found a running reindex task %s for this job; adopting it instead of starting another",
                                 task_id, extra={"event": "adopt", "task": task_id})
             if task_id is None:
+                create = self.plan[key].get("create")
+                if create and not self.cluster.index_exists(job.dest):
+                    self._phase(key, "creating")
+                    self.cluster.create_destination(job.dest, create)
+                    log.info("created %s %s (template %s)", create.replace("_", " "), job.dest,
+                             self.plan[key].get("template") or "none", extra={"event": "create"})
                 source_count = self.cluster.count(job.source)
                 with self.lock:
                     self.views[key].source_count = source_count
@@ -675,7 +722,7 @@ class Runner:
                              note=None, task=None, source_count=source_count, deleted_source=False)
                 task_id = self.cluster.start_reindex(
                     job, slices=a.slices, rps=a.requests_per_second, conflicts=a.conflicts,
-                    require_alias=a.require_alias)
+                    require_alias=a.require_alias, dest_kind=self.plan[key].get("dest_kind"))
                 self._record(key, task=task_id, flush=True)
                 log.info("started task %s for %d docs", task_id, source_count,
                          extra={"event": "start", "task": task_id, "counts": {"total": source_count}})
@@ -793,13 +840,18 @@ class Runner:
         processed = c["created"] + c["updated"] + c["noops"] + c["deleted"] + c["version_conflicts"]
         if processed != c["total"]:
             reasons.append(f"created+updated+noops+deleted+conflicts={processed} != total={c['total']}")
-        if c["version_conflicts"] and self.args.conflicts != "proceed":
+        kind = self.plan[job.key].get("dest_kind")
+        if c["version_conflicts"] and kind == "data_stream":
+            # op_type=create into an append-only target: a conflict means the doc is already there.
+            log.info("%d docs were already present in %s (earlier attempt); accepted for a data stream",
+                     c["version_conflicts"], job.dest, extra={"event": "already_present"})
+        elif c["version_conflicts"] and self.args.conflicts != "proceed":
             reasons.append(f"{c['version_conflicts']} version conflicts")
         source_count = int(st.get("source_count") or 0)
         if c["total"] != source_count:
             reasons.append(f"task total={c['total']} != source doc count={source_count} at start "
                            "(source still receiving writes?)")
-        if self.plan[job.key].get("dest_kind") == "index":
+        if kind in ("index", "data_stream"):
             try:
                 dest_count = self.cluster.count(job.dest)
             except (JobError, os_exc.OpenSearchException) as e:
@@ -946,7 +998,7 @@ class Runner:
         jobs.add_column("Rate", justify="right", no_wrap=True)
         jobs.add_column("Elapsed", justify="right", no_wrap=True)
         phase_style = {"reindexing": "cyan", "verifying": "yellow", "deleting": "bold red",
-                       "re-attaching": "magenta", "starting": "magenta"}
+                       "re-attaching": "magenta", "starting": "magenta", "creating": "magenta"}
         rows = sorted(active.items(), key=lambda kv: kv[1].started_at or 1e18)
         for key, v in rows[:max_rows]:
             c = v.counts or {}
@@ -1065,6 +1117,8 @@ def preflight(cluster: Cluster, jobs: list[Job], state: State, args: argparse.Na
     snap = cluster.snapshot()
 
     def resolve(name: str) -> tuple[str, str]:
+        if name in snap.data_streams:
+            return "data_stream", name
         if name in snap.aliases:
             targets = snap.aliases[name]
             if len(targets) == 1:
@@ -1080,7 +1134,8 @@ def preflight(cluster: Cluster, jobs: list[Job], state: State, args: argparse.Na
     for job in jobs:
         st = state.job(job.key)
         status = st.get("status", "pending")
-        row: dict[str, Any] = {"status": status, "count": 0, "dest_kind": None, "action": "reindex", "note": ""}
+        row: dict[str, Any] = {"status": status, "count": 0, "dest_kind": None, "action": "reindex", "note": "",
+                               "create": None, "template": None}
         plan[job.key] = row
         if status == "done":
             row.update(action="skip", note="done" + (" (source deleted)" if st.get("deleted_source") else ""))
@@ -1109,11 +1164,33 @@ def preflight(cluster: Cluster, jobs: list[Job], state: State, args: argparse.Na
             src_kind, _ = resolve(job.source)
             if src_kind == "index" and snap.indices[job.source].get("status") == "close":
                 raise JobError("source index is closed")
-            if args.delete_source and src_kind == "alias":
-                raise JobError("source is an alias; refusing with --delete-source")
-            kind, target = resolve(job.dest)
-            if kind == "index" and snap.indices[job.dest].get("status") == "close":
-                raise JobError("destination index is closed")
+            if args.delete_source and src_kind in ("alias", "data_stream"):
+                raise JobError(f"source is a {src_kind.replace('_', ' ')}; refusing with --delete-source")
+            if args.delete_source and src_kind == "index":
+                owner = next((n for n, d in snap.data_streams.items() if d["write_index"] == job.source), None)
+                if owner:
+                    raise JobError(f"source is the write index of data stream {owner!r}; "
+                                   "roll it over first or drop --delete-source")
+            try:
+                kind, target = resolve(job.dest)
+            except JobError:
+                if args.no_create:
+                    raise JobError(f"destination {job.dest!r} does not exist (--no-create)")
+                tpl = Cluster.match_template(snap, job.dest)
+                if tpl is None and not args.create_plain:
+                    raise JobError(f"destination {job.dest!r} does not exist and no index template matches it; "
+                                   "create it first or pass --create-plain")
+                kind = "data_stream" if tpl and tpl["data_stream"] else "index"
+                target = job.dest
+                row["create"] = kind
+                row["template"] = tpl["name"] if tpl else None
+                row["note"] = (f"create {kind.replace('_', ' ')} (template {tpl['name']})" if tpl
+                               else "create plain index (no template!)")
+            else:
+                if kind == "index" and snap.indices[job.dest].get("status") == "close":
+                    raise JobError("destination index is closed")
+                if kind == "data_stream":
+                    row["note"] = (row["note"] + " data stream").strip()
             if target == job.source:
                 raise JobError(f"destination {job.dest!r} resolves to the source index")
             if args.require_alias and kind != "alias":
@@ -1124,8 +1201,9 @@ def preflight(cluster: Cluster, jobs: list[Job], state: State, args: argparse.Na
             if src_kind == "index":
                 row["count"] = int(snap.indices[job.source].get("docs.count") or 0)
             else:
-                row["count"] = sum(int((snap.indices.get(i) or {}).get("docs.count") or 0)
-                                   for i in snap.aliases[job.source])
+                members = (snap.aliases[job.source] if src_kind == "alias"
+                           else snap.data_streams[job.source]["indices"])
+                row["count"] = sum(int((snap.indices.get(i) or {}).get("docs.count") or 0) for i in members)
         except JobError as e:
             row.update(action="error", note=str(e))
             problems.append(f"{job.key}: {e}")
@@ -1160,6 +1238,8 @@ def plan_table(jobs: list[Job], plan: dict[str, dict[str, Any]], delete_source: 
         action = p["action"]
         if action == "reindex" and delete_source:
             action = "reindex+delete"
+        if p.get("create"):
+            action = "create+" + action
         t.add_row(str(i), Text(j.source), Text(j.dest), f"{p['count']:,}" if p["count"] else "-",
                   Text(action, style=ACTION_STYLES[p["action"]]), Text(p["note"]))
     tally = Counter(p["action"] for p in plan.values())
@@ -1185,8 +1265,9 @@ def writes_table(jobs: list[Job], plan: dict[str, dict[str, Any]], args: argpars
     t.add_column("Kind", no_wrap=True)
     harmless = Text("write (refresh)", style="dim")
     write = Text("write", style="yellow")
+    create_kind = Text("write (create)", style="yellow")
     destructive = Text("DESTRUCTIVE", style="bold red")
-    n_writes = n_destructive = 0
+    n_writes = n_destructive = n_create = 0
     for j in jobs:
         p = plan[j.key]
         if p["action"] in ("skip", "error"):
@@ -1199,12 +1280,18 @@ def writes_table(jobs: list[Job], plan: dict[str, dict[str, Any]], args: argpars
             first = False
 
         if p["action"] == "reindex":
+            if p.get("create"):
+                tpl = f"  (template {p['template']})" if p.get("template") else "  (no template: dynamic mapping)"
+                row(f"PUT /_data_stream/{j.dest}{tpl}" if p["create"] == "data_stream" else f"PUT /{j.dest}{tpl}",
+                    create_kind)
+                n_create += 1
             row(f"POST /{j.source}/_refresh  (exact doc count before starting)", harmless)
             path, body = cluster.reindex_request(j, slices=args.slices, rps=args.requests_per_second,
-                                                 conflicts=args.conflicts, require_alias=args.require_alias)
+                                                 conflicts=args.conflicts, require_alias=args.require_alias,
+                                                 dest_kind=p.get("dest_kind"))
             row(f"{path}\n{json.dumps(body)}", write)
             n_writes += 1
-        if p["action"] in ("reindex", "re-attach") and p.get("dest_kind") == "index":
+        if p["action"] in ("reindex", "re-attach") and p.get("dest_kind") in ("index", "data_stream"):
             row(f"POST /{j.dest}/_refresh  (verification count)", harmless)
         if args.delete_source and p["action"] in ("reindex", "re-attach", "delete"):
             row(f"DELETE /{j.source}?expand_wildcards=none&allow_no_indices=false  (only after verification passes)",
@@ -1215,7 +1302,7 @@ def writes_table(jobs: list[Job], plan: dict[str, dict[str, Any]], args: argpars
     lines = [t,
              Text.assemble("Conditional: ", ("POST /_tasks/<id>/_cancel", "yellow"),
                            " for each running task on a second Ctrl+C."),
-             Text.assemble(f"Totals: {n_writes} reindex request(s), ",
+             Text.assemble(f"Totals: {n_create} destination(s) to create, {n_writes} reindex request(s), ",
                            (f"{n_destructive} index delete(s)", "bold red" if n_destructive else ""), ".")]
     reads = ", ".join(f"{k} x{v}" for k, v in sorted(cluster.reads.items()))
     lines.append(Text(f"Read-only requests this dry run sent: {reads}", style="dim"))
@@ -1325,6 +1412,12 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
                    help="delete each source index after its reindex passes verification")
     r.add_argument("--skip-missing", action="store_true",
                    help="skip jobs that fail preflight instead of aborting the run")
+    r.add_argument("--no-create", action="store_true",
+                   help="do not create missing destinations (default: create a data stream or index from the "
+                        "matching index template before the reindex)")
+    r.add_argument("--create-plain", action="store_true",
+                   help="allow creating a missing destination that matches no index template, as a plain "
+                        "dynamically-mapped index")
     r.add_argument("--poll-interval", type=float, default=5, help="seconds between task polls")
     r.add_argument("--poll-grace", type=float, default=300,
                    help="seconds to keep retrying an unreachable cluster before giving up on a job "
