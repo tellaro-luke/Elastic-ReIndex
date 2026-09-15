@@ -127,8 +127,8 @@ Default is `https://` with certificate verification **off** and the warning sile
 | `--tenant NAME` | off | `securitytenant` header (`global`, `private`, or a tenant name) for multi-tenancy |
 | `--dry-run` | off | Read-only preflight, plan, and the list of writes a real run would send |
 | `-y`, `--yes` | off | No confirmation prompt |
-| `--state-file`, `--reset-state`, `--retry-failed` | `reindex-state.json` | Checkpoint control |
-| `--log-file`, `--json-log` | `reindex.log`, `reindex.jsonl` | Log files. Pass `''` to disable |
+| `--state-file`, `--reset-state`, `--retry-failed` | `<list name>-state.json` | Checkpoint control (`reindex-state.json` for `list.txt`) |
+| `--log-file`, `--json-log` | `<list name>.log`, `<list name>.jsonl` | Log files (`reindex.log` and `reindex.jsonl` for `list.txt`). Pass `''` to disable |
 | `--no-tui`, `--debug` | off | Plain output; log every poll and HTTP request to the log files |
 | `--timezone ZONE` | `America/Chicago` | Zone for the dashboard clock and finish times: an IANA name, `utc` or `local`. Env: `REINDEX_TZ` |
 
@@ -245,8 +245,10 @@ reports that it would delete it.
 `done`, or `failed`, with the task id, document counts, timestamps, and the error for failed
 jobs. It is written atomically (temp file, fsync, rename) at most once a second and
 immediately after a task id is recorded. A lock file next to it stops a second process from
-using the same state file; run several batches with separate `--list`, `--state-file`,
-`--log-file` and `--json-log`. Note `.gitignore` only covers the default names.
+using the same state file. The default state and log names follow the list file, so a second
+session with its own list (say `list2.txt`, giving `list2-state.json`, `list2.log` and
+`list2.jsonl`) runs alongside the first with no flags, even against another cluster. Two
+sessions on the same list name need an explicit `--state-file` each.
 
 On the next run:
 

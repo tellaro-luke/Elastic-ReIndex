@@ -269,7 +269,9 @@ class State:
                 except (OSError, ValueError):
                     pid = 0
                 if pid and _pid_alive(pid):
-                    raise RuntimeError(f"{self.path} is in use by pid {pid} (lock file {self.lock_path})")
+                    raise RuntimeError(f"{self.path} is in use by pid {pid} (lock file {self.lock_path}). "
+                                       "A second run needs its own state file: use a different --list "
+                                       "(defaults follow the list name) or pass --state-file.")
                 self.lock_path.unlink(missing_ok=True)   # stale lock from a dead process
                 continue
             with os.fdopen(fd, "w") as fh:
@@ -2373,12 +2375,15 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     s.add_argument("--dry-run", action="store_true",
                    help="send only read requests; print the plan and every write a real run would send")
     s.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
-    s.add_argument("--state-file", type=Path, default=Path("reindex-state.json"),
-                   help="checkpoint file; one per batch, never shared between concurrent runs")
+    s.add_argument("--state-file", type=Path, default=None,
+                   help="checkpoint file; one per batch, never shared between concurrent runs "
+                        "(default: reindex-state.json for list.txt, otherwise <list name>-state.json)")
     s.add_argument("--reset-state", action="store_true", help="delete the state file before starting")
     s.add_argument("--retry-failed", action="store_true", help="re-run jobs recorded as failed")
-    s.add_argument("--log-file", type=Path, default=Path("reindex.log"), help="text log ('' to disable)")
-    s.add_argument("--json-log", type=Path, default=Path("reindex.jsonl"), help="JSON-lines log ('' to disable)")
+    s.add_argument("--log-file", type=Path, default=None,
+                   help="text log ('' to disable; default: reindex.log for list.txt, otherwise <list name>.log)")
+    s.add_argument("--json-log", type=Path, default=None,
+                   help="JSON-lines log ('' to disable; default: reindex.jsonl for list.txt, otherwise <list name>.jsonl)")
     s.add_argument("--no-tui", action="store_true", help="plain log lines instead of the live dashboard")
     s.add_argument("--debug", action="store_true", help="log every poll and HTTP request to the log files")
     s.add_argument("--timezone", default=env_default("REINDEX_TZ", DEFAULT_TZ), metavar="ZONE",
@@ -2427,6 +2432,14 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         a.dashboards_user = a.user
     if a.dashboards_password_env is None:
         a.dashboards_password_env = a.password_env
+    # Defaults follow the list file so two lists (or two clusters) never share a state file.
+    base = "reindex" if a.list.stem == "list" else a.list.stem
+    if a.state_file is None:
+        a.state_file = Path(f"{base}-state.json")
+    if a.log_file is None:
+        a.log_file = Path(f"{base}.log")
+    if a.json_log is None:
+        a.json_log = Path(f"{base}.jsonl")
     if str(a.log_file) in ("", "."):
         a.log_file = None
     if str(a.json_log) in ("", "."):

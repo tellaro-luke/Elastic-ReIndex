@@ -1,4 +1,5 @@
 reindex-state.json
+*-state.json
 *.lock
 !poetry.lock
 .reindex-state-*.tmp
