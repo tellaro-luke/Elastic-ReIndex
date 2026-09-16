@@ -452,6 +452,22 @@ class Cluster:
             raise JobError(f"count of {index!r} had {shards['failed']} failed shard(s); index may be red")
         return int(resp["count"])
 
+    def sample_ids(self, index: str, n: int = 100) -> list[str]:
+        """Random document ids from an index, alias or data stream (read-only)."""
+        self._read("GET /{index}/_search (id sample)")
+        body = {"size": n, "_source": False, "track_total_hits": False,
+                "query": {"function_score": {"query": {"match_all": {}}, "random_score": {}}}}
+        resp = self.os.search(index=index, body=body)
+        return [h["_id"] for h in (resp.get("hits") or {}).get("hits") or []]
+
+    def count_ids(self, index: str, ids: list[str]) -> int:
+        """How many of ``ids`` exist in an index, alias or data stream (read-only)."""
+        if not ids:
+            return 0
+        self._read("GET /{index}/_count (ids)")
+        resp = self.os.count(index=index, body={"query": {"ids": {"values": ids}}})
+        return int(resp.get("count") or 0)
+
     def get_task(self, task_id: str) -> dict[str, Any]:
         self._read("GET /_tasks/{id}")
         return self.os.tasks.get(task_id=task_id)
@@ -1379,9 +1395,25 @@ class Runner:
                            "no starting destination count was recorded, so the outcome cannot be verified; "
                            "re-run with --retry-failed to redo the reindex")
         gained = dest_now - int(start)
-        if gained < source_count:
-            raise JobError(f"task {task_id} is gone from the cluster; destination gained {gained:,} of "
-                           f"{source_count:,} docs (last poll {processed(last):,}); re-run with --retry-failed")
+        # Other running jobs writing into the same destination make the count ambiguous.
+        with self.lock:
+            shared = any(j.dest == job.dest and j.key != job.key and j.key not in self.results
+                         and self.views.get(j.key, JobView()).started_at for j in self.jobs)
+        # Independent evidence: a random sample of source ids must all exist in the destination.
+        try:
+            ids = self.cluster.sample_ids(job.source)
+            present = self.cluster.count_ids(job.dest, ids)
+        except (JobError, os_exc.OpenSearchException) as e:
+            raise JobError(f"task {task_id} is gone from the cluster and the id sample could not be checked: "
+                           f"{describe(e)}")
+        sample_ok = present == len(ids)
+        count_ok = gained >= source_count
+        evidence = (f"destination gained {gained:,} of {source_count:,} docs"
+                    f"{' (shared with another running job)' if shared else ''}; "
+                    f"{present}/{len(ids)} sampled source ids present")
+        if not sample_ok or (not shared and not count_ok):
+            raise JobError(f"task {task_id} is gone from the cluster; {evidence} (last poll "
+                           f"{processed(last):,}); re-run with --retry-failed")
         level = logging.INFO if self.task_results_missing else logging.WARNING
         if not self.task_results_missing:
             self.task_results_missing = True
@@ -1389,10 +1421,9 @@ class Runner:
                         "completion); jobs will be verified by document count from now on. Check the .tasks "
                         "index, ISM policies on hidden indices, and system-index protection.",
                         extra={"event": "task_results_unavailable"})
-        log.log(level, "task %s finished; stored result missing, verified by count instead: destination gained "
-                "%s docs for a source of %s", task_id, f"{gained:,}", f"{source_count:,}",
-                extra={"event": "task_result_missing", "task": task_id})
-        self._record(job.key, note=f"task result missing; verified by document count (+{gained:,})")
+        log.log(level, "task %s finished; stored result missing, verified by evidence instead: %s", task_id,
+                evidence, extra={"event": "task_result_missing", "task": task_id})
+        self._record(job.key, note=f"task result missing; verified by evidence: {evidence}")
         counts = dict.fromkeys(COUNT_FIELDS, 0)
         counts["total"] = source_count
         counts["created"] = source_count
