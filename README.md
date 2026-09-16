@@ -267,7 +267,11 @@ On the next run:
   up, blocked by a disk watermark, or lost with a node), the tool verifies by evidence instead:
   the destination must have gained at least the source's document count since the job
   started (recorded at start). The job is then `done` with a note; otherwise it fails with
-  the counts it saw.
+  the counts it saw. After the first such job in a run the tool stops waiting for the stored
+  result and goes straight to the count check. If this happens on every job, the cluster is
+  not keeping task results: check `GET _cat/indices/.tasks?v`, whether an ISM policy or cleanup
+  removes hidden indices, whether `.tasks` is listed under the security plugin's
+  `plugins.security.system_indices.indices`, and the node logs for task-result warnings.
 * A job that lost contact with its task (cluster unreachable for longer than `--poll-grace`)
   is reported as `lost`, keeps `running` status and its task id, and re-attaches next run.
 

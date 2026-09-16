@@ -1001,6 +1001,7 @@ class Runner:
         self.poll_stop = threading.Event()
         self.cluster_stats: dict[str, Any] = dict(cluster_stats or {})
         self.rejected_base: int | None = None
+        self.task_results_missing = False   # set once a finished task's stored result was unavailable
         # keyboard: key -> (help label, action). Extend via add_key(); the footer is built from it.
         self.keys: queue.Queue[str] = queue.Queue()
         self.keys_stop = threading.Event()
@@ -1333,7 +1334,7 @@ class Runner:
                     task = self.cluster.get_task(task_id)
                 except os_exc.NotFoundError:
                     missing += 1
-                    if missing < 3:
+                    if missing < 3 and not self.task_results_missing:
                         log.debug("task %s not found yet (%d); retrying", task_id, missing)
                         continue      # the stored result can lag the task list by a poll or two
                     return self._recover_without_result(job, task_id, log)
@@ -1381,9 +1382,16 @@ class Runner:
         if gained < source_count:
             raise JobError(f"task {task_id} is gone from the cluster; destination gained {gained:,} of "
                            f"{source_count:,} docs (last poll {processed(last):,}); re-run with --retry-failed")
-        log.warning("task %s finished but its stored result is missing (.tasks); verified by count instead: "
-                    "destination gained %s docs for a source of %s", task_id, f"{gained:,}", f"{source_count:,}",
-                    extra={"event": "task_result_missing", "task": task_id})
+        level = logging.INFO if self.task_results_missing else logging.WARNING
+        if not self.task_results_missing:
+            self.task_results_missing = True
+            log.warning("this cluster does not return finished task results (GET _tasks/<id> is 404 after "
+                        "completion); jobs will be verified by document count from now on. Check the .tasks "
+                        "index, ISM policies on hidden indices, and system-index protection.",
+                        extra={"event": "task_results_unavailable"})
+        log.log(level, "task %s finished; stored result missing, verified by count instead: destination gained "
+                "%s docs for a source of %s", task_id, f"{gained:,}", f"{source_count:,}",
+                extra={"event": "task_result_missing", "task": task_id})
         self._record(job.key, note=f"task result missing; verified by document count (+{gained:,})")
         counts = dict.fromkeys(COUNT_FIELDS, 0)
         counts["total"] = source_count
